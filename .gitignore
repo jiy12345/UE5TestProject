@@ -80,3 +80,6 @@ DerivedDataCache/
 # Rider
 .idea/
 *.sln.iml
+
+# Claude Code configuration
+.claude/
