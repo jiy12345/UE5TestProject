@@ -1,0 +1,26 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "{BDB17143-4C0A-B8DE-C7D9-679485F74B66}",
+	"Category": "",
+	"Description": "UE5 MVVM Pattern Implementation and Source Code Analysis Project",
+	"Modules": [
+		{
+			"Name": "UE5TestProject",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"AdditionalDependencies": [
+				"Engine",
+				"CoreUObject"
+			]
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "ModelViewViewModel",
+			"Enabled": true
+		}
+	],
+	"TargetPlatforms": [
+		"Windows"
+	]
+}
