@@ -81,7 +81,5 @@ DerivedDataCache/
 .idea/
 *.sln.iml
 
-# Claude Code configuration (exclude sensitive files only)
-.claude/.claude.json
-.claude/.claude.json.backup
-.claude/commands/private/
+# Claude Code configuration
+.claude/
