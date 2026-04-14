@@ -55,6 +55,75 @@ if (Result.IsSuccessful() && Result.Path.IsValid())
 }
 ```
 
+#### FindPathSync 내부 로직과 시간 복잡도
+
+**호출 체인**:
+```
+UNavigationSystemV1::FindPathSync()
+  └── ANavigationData::FindPath() (virtual)
+       └── ARecastNavMesh::FindPath()
+            └── FPImplRecastNavMesh::FindPath()
+                 ├── dtNavMeshQuery::findNearestPoly()   ← Start/End 포인트를 폴리곤으로 투사
+                 ├── dtNavMeshQuery::findPath()          ← A* 폴리곤 경로 탐색
+                 └── dtNavMeshQuery::findStraightPath()  ← 폴리곤 경로 → 직선 경로 (Funnel)
+```
+
+**각 단계의 시간 복잡도** (V = 검색 구역 내 폴리곤 수, E = 폴리곤 간 링크 수):
+
+| 단계 | 파일 (엔진) | 복잡도 | 설명 |
+|------|--------|--------|------|
+| `findNearestPoly()` | `DetourNavMeshQuery.cpp` | **O(log N + k)** | BV 트리 가속 검색. N=타일당 폴리곤, k=반환된 후보 수 |
+| `findPath()` (A\*) | `DetourNavMeshQuery.cpp:1578` | **O((V+E) log V)** | 바이너리 힙 우선순위 큐 기반 A\*. `RECAST_MAX_SEARCH_NODES=2048` 제한 |
+| `findStraightPath()` (Funnel) | `DetourNavMeshQuery.cpp` | **O(P)** | P=폴리곤 경로 길이. Simple Stupid Funnel Algorithm |
+
+**A\* findPath() 세부 로직** (`DetourNavMeshQuery.cpp:1578~1700`):
+
+```cpp
+dtStatus dtNavMeshQuery::findPath(dtPolyRef startRef, dtPolyRef endRef,
+    const dtReal* startPos, const dtReal* endPos, const dtReal costLimit,
+    const dtQueryFilter* filter, dtQueryResult& result, dtReal* totalCost)
+{
+    // 1. 시작 노드 초기화
+    dtNode* startNode = m_nodePool->getNode(startRef);
+    startNode->cost = 0;
+    startNode->total = heuristicCost(startPos, endPos);  // H_SCALE 가중 휴리스틱
+    m_openList->push(startNode);
+
+    // 2. A* 메인 루프
+    while (!m_openList->empty())
+    {
+        dtNode* bestNode = m_openList->pop();   // f-cost 최소 노드
+        if (bestNode->id == endRef) break;      // 목표 도달
+
+        // 3. 이웃 폴리곤 확장 (dtLink를 통해)
+        for (링크 in bestTile->links[bestPoly])
+        {
+            if (!filter->passFilter(neighbour)) continue;  // Null area 등 제외
+
+            float cost = bestNode->cost + edgeCost;        // g-cost
+            float total = cost + heuristic(neighbour, end);// f = g + h
+            if (total < neighbourNode->total)
+                m_openList->update(neighbourNode);         // 더 나은 경로 발견
+        }
+    }
+
+    // 4. 목표에서 역추적하여 폴리곤 경로 구성
+    // 5. 결과 반환
+}
+```
+
+**성능 특징:**
+- **노드 풀 제한**: `RECAST_MAX_SEARCH_NODES=2048` — 매우 긴 경로(예: 수백 m 거리의 복잡한 미로)에서 노드 풀 고갈 시 `DT_OUT_OF_NODES` 반환
+- **휴리스틱 가중치 `H_SCALE`**: 기본 약 1.0. 높이면 탐색이 목표 방향으로 편향되어 빨라지지만 최적 경로 보장 안 됨
+- **타일 기반 pruning**: A\*는 타일 경계를 넘어 이웃 타일의 폴리곤으로 이어짐 — 로드되지 않은 타일은 자동으로 탐색에서 배제됨 (WP/레벨 스트리밍)
+
+**실무적 복잡도**:
+- 단거리 (동일 타일 내): 수십 ~ 수백 μs
+- 장거리 (수십 타일 횡단): 수 ms, 최악 수십 ms
+- 경로 블로킹(완전 막힘) 감지: 전체 `MAX_SEARCH_NODES`를 다 쓰고 나서 실패 — 가장 비싼 경우
+
+비동기 경로 요청(`FindPathAsync`)은 이 계산을 워커 스레드에서 수행합니다 (`dtNavMeshQuery`는 스레드별 인스턴스 필요, 3-3절 비동기 패턴 참조).
+
 ### NavQueryFilter 커스터마이징
 
 ```cpp
@@ -326,6 +395,35 @@ LargeAgentProps.AgentHeight = 200.f;
 ANavigationData* NavData = NavSys->GetNavDataForProps(LargeAgentProps);
 FPathFindingQuery Query(this, *NavData, Start, End);
 ```
+
+#### 에이전트가 여러 개면 NavMesh도 여러 개
+
+프로젝트 설정의 `Project Settings > Navigation System > Supported Agents`에 **N개의 에이전트를 등록하면, 레벨에는 N개의 `ARecastNavMesh` 액터가 생성됩니다**.
+
+**소스**: `UNavigationSystemV1::PostInitProperties()` (`NavigationSystem.cpp`)
+- `SupportedAgents` 배열을 순회하면서 각 에이전트에 대해 `CreateNavigationDataInstanceInLevel()` 호출
+- 각 호출이 해당 에이전트 전용 `ARecastNavMesh` 인스턴스를 스폰하고 `NavDataSet`에 등록
+
+**구조:**
+
+```
+UWorld
+ └── UNavigationSystemV1
+      ├── SupportedAgents: [Human(r=34,h=144), Mob(r=100,h=200), Drone(r=50,h=80)]
+      └── NavDataSet:
+           ├── ARecastNavMesh-Human   (Human용 메시: 좁은 통로 통과 가능)
+           ├── ARecastNavMesh-Mob     (Mob용 메시: 좁은 통로 배제된 별도 지오메트리)
+           └── ARecastNavMesh-Drone   (Drone용 메시)
+```
+
+**중요한 비용 특성:**
+- 각 `ARecastNavMesh`는 **독립적으로 전체 레벨을 빌드**합니다 (지오메트리는 공유하지만 복셀화/폴리곤 생성은 별도).
+- 따라서 에이전트 수가 늘어나면 **빌드 시간/메모리/디스크 용량이 거의 선형적으로 증가**.
+- 런타임 경로 쿼리도 에이전트별로 적절한 NavData를 선택해야 함 — `GetNavDataForProps()` 또는 `UNavigationSystemV1::GetNavDataForAgentName()` 사용.
+
+**실무 권장:**
+- 에이전트는 꼭 필요한 만큼만. 캐릭터의 `AgentRadius`가 비슷하면 하나로 통합하고 카테고리별 NavAreaCost로 구분 가능.
+- 모든 에이전트가 같은 `TileSizeUU`를 사용하면 타일 그리드가 정렬되어 WP 스트리밍 효율성이 높아짐.
 
 ### 패턴 3: 비동기 경로 요청
 

@@ -9,7 +9,7 @@
 
 **파일**: `Engine/Source/Runtime/NavigationSystem/Public/NavMesh/RecastNavMesh.h:572`
 
-#### 주요 상수
+#### 주요 상수 및 수정 영향
 
 ```cpp
 #define RECAST_MAX_SEARCH_NODES     2048       // A* 노드 풀 크기
@@ -21,7 +21,15 @@
 #define RECAST_UNWALKABLE_POLY_COST FLT_MAX    // 이동 불가 폴리곤 비용
 ```
 
-#### 주요 UPROPERTY (에디터 설정)
+| 상수 | 수정 시 영향 |
+|------|--------------|
+| `RECAST_MAX_SEARCH_NODES` | A\* 탐색 시 오픈/클로즈드 리스트 최대 노드 수. 줄이면 메모리 절감 but 긴 경로 탐색 실패 가능(`DT_OUT_OF_NODES`). 늘리면 폴리곤당 ~20바이트 추가 소비. |
+| `RECAST_MIN_TILE_SIZE` | `TileSizeUU`가 이 값보다 작으면 빌드 거부. 낮추면 초소형 타일 허용 but 타일 경계 링크 오버헤드 급증. |
+| `RECAST_MAX_AREAS` | `dtPoly::areaAndtype`의 하위 6비트가 Area ID라서 **64가 하드 리미트** (6bit = 0-63). 이 값을 늘리려면 Detour 비트 레이아웃 자체를 수정해야 함. 현실적으로 고정. |
+| `RECAST_DEFAULT_AREA` / `RECAST_NULL_AREA` / `RECAST_LOW_AREA` | 내장 NavArea의 ID. 변경하면 직렬화된 네비메시 데이터와 호환성 깨짐 — **수정 금지**. |
+| `RECAST_UNWALKABLE_POLY_COST` | `dtQueryFilter`에서 Null 영역 비용. `FLT_MAX`보다 낮추면 AI가 Null 영역을 "비싸지만 통과 가능"으로 보고 가로지를 수 있음. |
+
+#### 주요 UPROPERTY (에디터 설정) 및 수정 영향
 
 ```cpp
 // 타일 설정
@@ -52,6 +60,17 @@ UPROPERTY(EditAnywhere, Category=Runtime, config)
 ERuntimeGenerationType RuntimeGeneration;
 ```
 
+| 프로퍼티 | 수정 시 영향 |
+|----------|--------------|
+| `TileSizeUU` | 타일당 메모리/빌드 시간에 비례. 크게 하면 타일 수 ↓ · 타일당 빌드 시간 ↑. 작게 하면 반대. WP 스트리밍에서는 청크 단위 ↔ 타일 단위 매핑이 달라져 재빌드 필요. |
+| `NavMeshResolutionParams.CellSize` | 복셀 그리드 XY 해상도. 절반으로 줄이면 복셀 수 4배 → 빌드 시간/메모리 제곱 증가. 낮출수록 경사/좁은 통로 정밀도 ↑. |
+| `NavMeshResolutionParams.CellHeight` | 복셀 Z 해상도. 계단/턱 판정 정밀도 결정. 에이전트 스텝 높이보다 작아야 함. |
+| `AgentRadius` | **모든 설정 중 가장 영향이 큼**. 변경하면 전체 네비메시 재빌드 필수. Recast가 이 값만큼 장애물에서 "밀어내" 폴리곤을 생성하므로, 에이전트 캡슐 반경과 불일치하면 벽에 끼거나 틈새 통과 불가. |
+| `AgentHeight` | 저공간(낮은 천장) 판정에 사용. 증가시키면 기존 통과 가능 영역이 막힐 수 있음. |
+| `AgentMaxSlope` | `walkableSlopeAngle`. 급경사 배제 기준. 전체 재빌드 필요. |
+| `RegionPartitioning` | Watershed = 깔끔한 영역 분할(느림), Monotone = 빠름(영역 품질↓), ChunkyMonotone = 타협안. 타일당 빌드 시간에 직접 영향. |
+| `RuntimeGeneration` | 런타임 동작 자체를 결정 (2-9 참조). 변경해도 이미 쿠킹된 데이터 자체는 그대로 — 에디터에서 다시 빌드해야 실질 반영. |
+
 #### 주요 메서드
 
 ```cpp
@@ -74,6 +93,13 @@ virtual void DetachNavMeshDataChunk(URecastNavMeshDataChunk& NavDataChunk);
 const TSet<FIntPoint>& GetActiveTileSet() const;
 TSet<FIntPoint>& GetActiveTileSet();
 ```
+
+> **소스 확인 위치**
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavMesh/RecastNavMesh.h:1` — `RECAST_MAX_SEARCH_NODES`, `RECAST_MAX_AREAS` 등 상수 매크로 정의
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavMesh/RecastNavMesh.h:572` — `ARecastNavMesh` 클래스 본문: `TileSizeUU`, `AgentRadius`, `RuntimeGeneration` UPROPERTY 선언
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavMesh/RecastNavMesh.h` — `GetRecastMesh()`, `GetTileCacheLayers()`, `AddTileCacheLayer()`, `AttachNavMeshDataChunk()` 선언
+> - `Engine/Source/Runtime/NavigationSystem/Private/NavMesh/RecastNavMesh.cpp` — `ARecastNavMesh::AttachNavMeshDataChunk()` / `DetachNavMeshDataChunk()` 구현
+> - `Engine/Source/Runtime/NavigationSystem/Private/NavMesh/RecastNavMesh.cpp` — `ARecastNavMesh::AddTileCacheLayer()` / `RemoveTileCacheLayer()`: `CompressedTileCacheLayers` TMap 관리
 
 ---
 
@@ -110,6 +136,12 @@ protected:
     uint32                  Version;              // 빌드 버전
 };
 ```
+
+> **소스 확인 위치**
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavMesh/RecastNavMeshGenerator.h:784` — `FRecastNavMeshGenerator` 클래스 선언 전체: 빌드 제어 메서드, `InclusionBounds`, `ExclusionBounds`, `Config` 멤버
+> - `Engine/Source/Runtime/NavigationSystem/Private/NavMesh/RecastNavMeshGenerator.cpp` — `FRecastNavMeshGenerator::RebuildDirtyAreas()`: Dirty Area → `MarkDirtyTiles()` 호출 구현
+> - `Engine/Source/Runtime/NavigationSystem/Private/NavMesh/RecastNavMeshGenerator.cpp` — `FRecastNavMeshGenerator::TickAsyncBuild()`: 완료된 타일 통합 및 신규 작업 큐 디스패치
+> - `Engine/Source/Runtime/NavigationSystem/Private/NavMesh/RecastNavMeshGenerator.cpp` — `FRecastNavMeshGenerator::AddGeneratedTilesAndGetUpdatedTiles()`: `dtNavMesh::addTile()` 호출
 
 ---
 
@@ -151,6 +183,11 @@ struct FRecastBuildConfig : public rcConfig
 };
 ```
 
+> **소스 확인 위치**
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavMesh/RecastNavMeshGenerator.h:55` — `FRecastBuildConfig` 구조체: UE 추가 멤버(`AgentHeight`, `SkipNavGeometry`, `borderSize` 등) 선언
+> - `Engine/Source/Runtime/Navmesh/Public/Recast/Recast.h` — `rcConfig` 원본 구조체: `cs`, `ch`, `walkableHeight`, `maxVertsPerPoly` 등 멤버 정의
+> - `Engine/Source/Runtime/NavigationSystem/Private/NavMesh/RecastNavMeshGenerator.cpp` — `FRecastNavMeshGenerator::Init()` 또는 빌드 설정 초기화 함수: `FRecastBuildConfig`에 값 채우는 로직
+
 ---
 
 ### FNavTileRef
@@ -166,6 +203,10 @@ struct FNavTileRef
     // 타일 X, Y, Layer는 dtNavMesh::decodePolyId()로 분리 가능
 };
 ```
+
+> **소스 확인 위치**
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavMesh/RecastNavMesh.h` — `FNavTileRef` 구조체 선언: `TileDataId` 멤버
+> - `Engine/Source/Runtime/Navmesh/Public/Detour/DetourNavMesh.h` — `dtNavMesh::decodePolyId()`: 타일 X, Y, Layer, 폴리곤 인덱스 비트 분리 방법
 
 ---
 
@@ -216,6 +257,12 @@ static const int DT_MAX_AREAS         = 64;
 static const unsigned int DT_NULL_LINK = 0xffffffff;
 ```
 
+> **소스 확인 위치**
+> - `Engine/Source/Runtime/Navmesh/Public/Detour/DetourNavMesh.h:502` — `dtNavMesh` 클래스 선언 전체: `addTile()`, `removeTile()`, `getTileAt()`, `calcTileLoc()` 등
+> - `Engine/Source/Runtime/Navmesh/Public/Detour/DetourNavMesh.h` — `dtPolyRef`, `dtTileRef` typedef, `DT_VERTS_PER_POLYGON`, `DT_MAX_AREAS` 상수 정의
+> - `Engine/Source/Runtime/Navmesh/Private/Detour/DetourNavMesh.cpp` — `dtNavMesh::addTile()`: 타일 메모리 블록 파싱 및 내부 링크 생성 구현
+> - `Engine/Source/Runtime/Navmesh/Private/Detour/DetourNavMesh.cpp` — `dtNavMesh::removeTile()`: 타일 참조 해제 및 메모리 반환 구현
+
 ---
 
 ### dtMeshTile
@@ -243,6 +290,11 @@ struct dtMeshTile
     dtMeshTile*    next;            // 같은 그리드 위치의 다음 레이어
 };
 ```
+
+> **소스 확인 위치**
+> - `Engine/Source/Runtime/Navmesh/Public/Detour/DetourNavMesh.h:421` — `dtMeshTile` 구조체 선언: 모든 포인터 멤버와 `data` 블록 소유권 관계
+> - `Engine/Source/Runtime/Navmesh/Public/Detour/DetourNavMesh.h` — `dtMeshHeader` 구조체: `polyCount`, `vertCount`, `maxLinkCount`, `detailMeshCount` 등 타일 크기 메타데이터
+> - `Engine/Source/Runtime/Navmesh/Private/Detour/DetourNavMesh.cpp` — `dtNavMesh::addTile()`: `data` 블록 포인터를 파싱하여 각 멤버에 할당하는 로직
 
 ---
 
@@ -277,6 +329,11 @@ enum dtPolyTypes
 };
 ```
 
+> **소스 확인 위치**
+> - `Engine/Source/Runtime/Navmesh/Public/Detour/DetourNavMesh.h:205` — `dtPoly` 구조체: `areaAndtype` 비트 레이아웃, `getArea()` / `getType()` 인라인 메서드
+> - `Engine/Source/Runtime/Navmesh/Public/Detour/DetourNavMesh.h` — `dtPolyTypes` 열거형: `DT_POLYTYPE_GROUND`, `DT_POLYTYPE_OFFMESH_POINT` 값 정의
+> - `Engine/Source/Runtime/NavigationSystem/Private/NavMesh/RecastNavMeshGenerator.cpp` — `FRecastTileGenerator::ApplyModifiers()`: `dtPoly::setArea()`를 통해 Nav Modifier 영역 ID 적용
+
 ---
 
 ### dtLink
@@ -296,6 +353,11 @@ struct dtLink
     unsigned char bmax;   // 서브에지 최대 범위 [0,255]
 };
 ```
+
+> **소스 확인 위치**
+> - `Engine/Source/Runtime/Navmesh/Public/Detour/DetourNavMesh.h:252` — `dtLink` 구조체: `ref`, `side`, `bmin`, `bmax` 멤버 정의
+> - `Engine/Source/Runtime/Navmesh/Private/Detour/DetourNavMesh.cpp` — `dtNavMesh::connectExtLinks()`: 타일 경계에서 인접 타일과 `dtLink`를 생성하는 로직 (portal 연결)
+> - `Engine/Source/Runtime/Navmesh/Private/Detour/DetourNavMesh.cpp` — `dtNavMesh::addTile()`: 내부 폴리곤 링크(`DT_NULL_LINK` 초기화 → 링크 할당) 설정
 
 ---
 
@@ -346,6 +408,12 @@ public:
                               const int maxVisitedSize) const;
 };
 ```
+
+> **소스 확인 위치**
+> - `Engine/Source/Runtime/Navmesh/Public/Detour/DetourNavMeshQuery.h` — `dtNavMeshQuery` 클래스 선언: `findNearestPoly()`, `findPath()`, `findStraightPath()`, `raycast()`, `moveAlongSurface()` 시그니처
+> - `Engine/Source/Runtime/Navmesh/Private/Detour/DetourNavMeshQuery.cpp` — `dtNavMeshQuery::findPath()`: A* 알고리즘 구현, `m_nodePool` 노드 풀 사용
+> - `Engine/Source/Runtime/Navmesh/Private/Detour/DetourNavMeshQuery.cpp` — `dtNavMeshQuery::findStraightPath()`: 폴리곤 경로 → 월드 좌표 직선 경로 변환
+> - `Engine/Source/Runtime/NavigationSystem/Private/NavMesh/PImplRecastNavMesh.cpp` — `FPImplRecastNavMesh::FindPath()`: `dtNavMeshQuery`를 풀에서 꺼내 `findPath()` → `findStraightPath()` 호출하는 UE 래퍼
 
 ---
 
@@ -424,3 +492,123 @@ enum class ENavigationDirtyFlag : uint8
 ```
 
 `DynamicModifiersOnly` 모드에서는 `DynamicModifier` 플래그를 가진 Dirty Area만 처리됩니다.
+
+---
+
+## 4. 클래스 간 데이터 관계도
+
+### 4-1. 소유·참조 관계
+
+```
+AActor
+   ↑ (상속)
+ANavigationData (abstract)  ────┐
+   ↑ (상속)                      │ UNavigationSystemV1.NavDataSet[] 로 보관
+ARecastNavMesh  ◀────────────────┘
+   │
+   ├─ owns ─▶ FPImplRecastNavMesh (PIMPL)
+   │            │
+   │            ├─ owns ─▶ dtNavMesh*                     (타일 그래프)
+   │            │            │
+   │            │            └─ owns ─▶ dtMeshTile[]      (개별 타일)
+   │            │                          │
+   │            │                          ├─ dtPoly[]    (볼록 다각형)
+   │            │                          ├─ dtLink[]    (폴리곤 간 링크)
+   │            │                          ├─ float verts[] (버텍스)
+   │            │                          └─ dtBVNode[]  (가속 트리)
+   │            │
+   │            ├─ shared ─▶ dtNavMeshQuery (게임 스레드용 SharedNavQuery)
+   │            │
+   │            └─ TMap ──▶ CompressedTileCacheLayers     (복셀 레이어 캐시)
+   │                           ↓
+   │                           dtTileCacheLayer (TileX,TileY 별)
+   │
+   ├─ owns ─▶ TUniquePtr<FNavDataGenerator>
+   │            └─ FRecastNavMeshGenerator
+   │                 ├─ refs ──▶ ARecastNavMesh (DestNavMesh)
+   │                 ├─ holds ──▶ FRecastBuildConfig (rcConfig 확장)
+   │                 ├─ holds ──▶ InclusionBounds / ExclusionBounds
+   │                 ├─ queue ──▶ PendingDirtyTiles[]
+   │                 └─ queue ──▶ RunningDirtyTiles[]
+   │                                 └─ FRecastTileGenerator
+   │                                       ├─ holds ──▶ RawGeometry[]
+   │                                       ├─ holds ──▶ Modifiers[]
+   │                                       ├─ holds ──▶ rcHeightfield*
+   │                                       └─ produces ──▶ FNavMeshTileData[]
+   │                                                         ↓ addTile()
+   │                                                         dtMeshTile
+   │
+   └─ owns ─▶ FRecastNavMeshCachedData (Area/Filter 캐시)
+
+UNavigationSystemV1 (UWorld당 1개)
+   │
+   ├─ holds ──▶ TArray<ANavigationData*> NavDataSet       (에이전트별 여러 개)
+   ├─ holds ──▶ TArray<FNavDataConfig> SupportedAgents
+   ├─ holds ──▶ FNavigationOctree                         (공간 분할)
+   │              └─ TOctree2<FNavigationOctreeElement>
+   │                    └─ FNavigationRelevantData
+   │                          ├─ Modifiers (FAreaNavModifier[])
+   │                          ├─ NavLinks (FSimpleLinkNavModifier[])
+   │                          └─ HasGeometry / HasDynamicModifiers
+   │
+   └─ holds ──▶ FNavigationDirtyAreasController
+                  └─ TArray<FNavigationDirtyArea>
+                        ├─ FBox Bounds
+                        └─ ENavigationDirtyFlag Flags
+
+URecastNavMeshDataChunk (스트리밍 단위)
+   └─ AttachTiles/DetachTiles ──▶ ARecastNavMesh
+```
+
+### 4-2. Area ID / NavArea 클래스 간 연결
+
+```
+UNavArea (C++ 클래스)                  ──Registered──▶ UNavigationSystemV1.RegisteredNavAreaClasses
+   │ StaticClass / DefaultCost               │
+   ↓                                          ↓
+FAreaNavModifier.AreaClass ────────▶ Area ID (0-63) ────▶ dtPoly.areaAndtype (6비트)
+   (NavModifierVolume, NavModifierComponent)       │
+                                                   ↓
+                                     dtQueryFilter::m_areaCost[ID] ──▶ A* 비용
+```
+
+각 `UNavArea` 서브클래스는 등록 시 0-63 범위의 Area ID를 할당받고, 이 ID가 `dtPoly::areaAndtype` 하위 6비트에 저장됩니다. 쿼리 시 `dtQueryFilter`는 Area ID별 비용을 룩업하여 A\* 경로 비용에 반영합니다.
+
+### 4-3. Dirty Flag → 빌드 경로 매핑
+
+```
+FNavigationRelevantData.GetDirtyFlag()
+                ↓
+        FNavigationDirtyArea.Flags
+                ↓
+FRecastNavMeshGenerator::MarkDirtyTiles()
+                ↓
+     ┌──────────────────────┬───────────────────────┐
+     ↓                      ↓                       ↓
+  Geometry             DynamicModifier         NavigationBounds
+  (+IsGameStaticNavMesh면 skip)  │                   │
+     ↓                      ↓                       ↓
+FRecastTileGenerator    CompressedTileCache 경로   전체 재빌드
+  전체 파이프라인         (복셀 재사용)              + Bounds 갱신
+  (GatherGeometry → ...)     ↓
+                          MarkDynamicAreas()
+                          (Area ID만 재할당)
+```
+
+> **소스 확인 위치**
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavigationSystem.h:316,413,427` — `UNavigationSystemV1`, `SupportedAgents`, `NavDataSet`
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavMesh/RecastNavMesh.h:573,1572` — `ARecastNavMesh`, `RecastNavMeshImpl` 포인터
+> - `Engine/Source/Runtime/NavigationSystem/Private/NavMesh/PImplRecastNavMesh.h:271-284` — `FPImplRecastNavMesh` 멤버 (소유 관계)
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavMesh/RecastNavMeshGenerator.h:361,784` — 빌드 측 관계
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavigationOctree.h:172` — `FNavigationOctree` 선언
+> - `Engine/Source/Runtime/NavigationSystem/Private/NavigationDirtyAreasController.cpp` — Dirty Area 흐름
+
+---
+
+> **소스 확인 위치**
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavAreas/NavArea.h` — `UNavArea` 클래스: `DefaultCost`, `DrawColor`, `SupportedAgentsBitmask` UPROPERTY 선언
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavAreas/NavArea_Default.h` — `UNavArea_Default` (Area ID 63, DefaultCost 1.0)
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavAreas/NavArea_Null.h` — `UNavArea_Null` (Area ID 0, DefaultCost FLT_MAX)
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavigationTypes.h` — `FAreaNavModifier`, `FNavigationRelevantData`, `ENavigationDirtyFlag` 선언
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavigationTypes.h:135` — `FNavigationRelevantData::GetDirtyFlag()`: `HasDynamicModifiers()` 분기로 `DynamicModifier` 플래그 결정 로직
+> - `Engine/Source/Runtime/NavigationSystem/Private/NavMesh/RecastNavMeshGenerator.cpp` — `FRecastTileGenerator::ApplyModifiers()`: `FAreaNavModifier` 목록을 순회하여 `dtPoly::setArea()` 적용
