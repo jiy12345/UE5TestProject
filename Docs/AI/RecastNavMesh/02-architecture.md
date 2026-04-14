@@ -34,44 +34,197 @@ UNavigationSystemV1                           (UWorld당 하나, 전체 관리)
 
 ### 1-2. ANavigationData가 추상 베이스인 이유
 
-`ANavigationData`는 `abstract`로 선언되어 있고, 내비게이션 구현체의 **공통 인터페이스** 역할을 합니다. Recast 이외의 구현을 플러그인 방식으로 교체하거나 혼용할 수 있도록 분리되어 있습니다.
+`ANavigationData`는 `abstract`로 선언되어 있고, 내비게이션 구현체의 **공통 인터페이스 + 공통 인프라** 역할을 합니다.
 
 **파일**: `Engine/Source/Runtime/NavigationSystem/Public/NavigationData.h:545`
 
 ```cpp
 UCLASS(config=Engine, defaultconfig, NotBlueprintable, abstract, MinimalAPI)
 class ANavigationData : public AActor, public INavigationDataInterface
-{
-    // ... 공통 가상 메서드들
-    virtual bool NeedsRebuild() const;
-    virtual bool SupportsRuntimeGeneration() const;
-    virtual bool SupportsStreaming() const;
-    virtual void RebuildAll();
-    virtual void RebuildDirtyAreas(const TArray<FNavigationDirtyArea>& DirtyAreas);
-    virtual FPathFindingResult FindPath(...);
-    virtual FNavLocation GetRandomPoint(...) const;
-    virtual bool ProjectPoint(...) const;
-    // ...
-};
 ```
 
-**현재 존재하는 서브클래스:**
+#### ANavigationData가 직접 구현하는 핵심 로직
+
+"순수 인터페이스"가 아니라 **상당한 양의 공통 로직을 직접 구현**하고 있어 서브클래스는 실제 쿼리 알고리즘만 얹으면 됩니다.
+
+**1) 경로 추적 및 재요청 (Path tracking & invalidation)**
+
+**파일**: `NavigationData.cpp:285-405, 459-768`
+
+```cpp
+TArray<FNavPathWeakPtr> ActivePaths;                  // 활성 경로 목록
+TArray<FNavPathRecalculationRequest> RepathRequests;  // Repath 큐
+TArray<FNavigationPath::FObserver> ObservedPaths;     // 관찰 경로 (목표 이동 추적)
+
+void RegisterActivePath(FNavPathSharedPtr Path);      // 경로 수명 추적
+void PurgeUnusedPaths();                              // 만료 경로 정리
+void RequestRePath(FNavPathSharedRef Path, ENavPathUpdateType Reason);  // Repath 요청
+void TickActor(float DeltaTime, ELevelTick TickType, FActorTickFunction& ThisTickFunction);
+// 매 틱 ObservedPaths 순회 + RepathRequests 처리
+```
+
+**2) NavArea 레지스트리 (Supported Areas management)**
+
+**파일**: `NavigationData.cpp:757-897`
+
+```cpp
+TArray<FSupportedAreaData> SupportedAreas;            // 이 NavData가 지원하는 Area 목록
+TMap<const UClass*, int32> AreaClassToIdMap;          // UNavArea 서브클래스 → 내부 ID
+
+void ProcessNavAreas(const TSet<const UClass*>& AreaClasses, int32 AgentIndex);
+void OnNavAreaAdded(const UClass* NavAreaClass, int32 AgentIndex);
+int32 GetAreaID(const UClass* AreaClass) const;       // 클래스 → ID 조회
+const UClass* GetAreaClass(int32 AreaID) const;       // ID → 클래스 역조회
+```
+
+`ARecastNavMesh`의 `RECAST_MAX_AREAS=64` 비트 레이아웃은 이 ID 공간을 따라갑니다.
+
+**3) 쿼리 필터 레지스트리 (Query filter registry)**
+
+**파일**: `NavigationData.cpp:913-921`, `NavigationData.h:809`
+
+```cpp
+FSharedNavQueryFilter DefaultQueryFilter;                                 // 기본 필터
+TMap<UClass*, FSharedConstNavQueryFilter> QueryFilters;                   // 필터 캐시
+
+FSharedConstNavQueryFilter GetQueryFilter(TSubclassOf<UNavigationQueryFilter> FilterClass) const;
+void StoreQueryFilter(TSubclassOf<UNavigationQueryFilter> FilterClass, FSharedConstNavQueryFilter Filter);
+```
+
+**4) 제너레이터 라이프사이클**
+
+**파일**: `NavigationData.cpp:585-715`, `.h:1062`
+
+```cpp
+TSharedPtr<FNavDataGenerator> NavDataGenerator;
+TArray<FNavigationDirtyArea> SuspendedDirtyAreas;  // 일시중단 시 누적
+
+virtual void ConditionalConstructGenerator();      // 서브클래스가 override
+void RebuildDirtyAreas(const TArray<FNavigationDirtyArea>& DirtyAreas);
+// 서스펜드 상태면 SuspendedDirtyAreas에 쌓고, 풀리면 제너레이터에 디스패치
+void SetRebuildingSuspended(bool bNewSuspended);
+```
+
+**5) 등록 상태 / 버저닝**
+
+```cpp
+uint8 bRegistered : 1;                            // NavigationSystem 등록 여부
+int32 DataVersion = NAVDATAVER_LATEST;  // 13    // 데이터 포맷 버전
+
+virtual void OnRegistered();
+virtual void OnUnregistered();
+void RequestRegistration();                        // NavigationSystem에 등록 요청
+```
+
+**6) 에이전트 설정 및 디버그 렌더링**
+
+```cpp
+FNavDataConfig NavDataConfig;                     // AgentRadius, AgentHeight 등
+UPROPERTY() TObjectPtr<UPrimitiveComponent> RenderingComp;  // 디버그 표시 컴포넌트
+
+virtual UPrimitiveComponent* ConstructRenderingComponent();  // 서브클래스가 커스텀 가능
+// ARecastNavMesh → UNavMeshRenderingComponent
+// AAbstractNavData → nullptr (렌더링 없음)
+```
+
+#### 서브클래스가 구현해야 할 인터페이스
+
+**a) 함수 포인터 기반 (hot-path 성능 최적화)**
+
+가상 함수(vtable) 오버헤드를 피하기 위한 특이한 패턴입니다.
+
+**파일**: `NavigationData.h:1046-1059`
+
+```cpp
+typedef FPathFindingResult (*FFindPathPtr)(const FNavAgentProperties&,
+                                            const FPathFindingQuery&);
+FFindPathPtr FindPathImplementation;              // FindPath 본체 포인터
+FFindPathPtr FindHierarchicalPathImplementation;
+FTestPathPtr TestPathImplementation;
+FNavRaycastWithAdditionalResultsPtr RaycastImplementationWithAdditionalResults;
+
+// 베이스 클래스의 FindPath는 단순히 포인터를 호출할 뿐
+FPathFindingResult FindPath(const FNavAgentProperties& Agent, const FPathFindingQuery& Q) const
+{
+    check(FindPathImplementation);
+    return (*FindPathImplementation)(Agent, Q);
+}
+```
+
+서브클래스는 생성자에서 static 함수를 포인터에 할당 (`RecastNavMesh.cpp:529-535`):
+```cpp
+ARecastNavMesh::ARecastNavMesh()
+{
+    FindPathImplementation = FindPath;          // ARecastNavMesh::FindPath (static)
+    TestPathImplementation = TestPath;
+    RaycastImplementationWithAdditionalResults = NavMeshRaycast;
+}
+```
+
+**b) PURE_VIRTUAL 메서드 (서브클래스 필수 override)**
+
+**파일**: `NavigationData.h:778-967`
+
+| 메서드 | 역할 |
+|--------|------|
+| `GetBounds()` | 이 NavData가 커버하는 공간 |
+| `ProjectPoint()` / `BatchProjectPoints()` | 월드 좌표 → 네비 위 투사 |
+| `GetRandomPoint()` / `GetRandomReachablePointInRadius()` | 랜덤 포인트 샘플링 |
+| `BatchRaycast()` | 다중 레이캐스트 |
+| `FindMoveAlongSurface()` | 표면 이동 (미끄러짐) |
+| `FindOverlappingEdges()` | 경계 에지 탐색 |
+| `GetPathSegmentBoundaryEdges()` | 경로 세그먼트 경계 |
+| `CalcPathCost()` / `CalcPathLength()` | 경로 비용/길이 |
+| `DoesNodeContainLocation()` | 노드 포함 여부 |
+
+서브클래스가 이 전부를 구현하면 NavigationSystem / AIController / PathFollowingComponent 등 상위 레이어와 자동으로 연동됩니다.
+
+#### 실제로 분리해두어서 얻는 구체적 이득
+
+1. **UNavigationSystemV1의 쿼리 라우팅**: `GetNavDataForProps(AgentProps)`가 에이전트 프로퍼티에 맞는 NavData를 찾아 반환 — Recast든 커스텀이든 동일하게 동작.
+2. **AIController / PathFollowingComponent**: `ANavigationData*` 타입만 알고 쿼리 — Recast 내부에 직접 의존하지 않음. 내비 구현을 바꿔도 AI 코드 수정 불필요.
+3. **Navigation Invoker 시스템**: invoker 기반 타일 로딩이 `ANavigationData` 인터페이스로 구현되어 모든 구현체에 적용 가능.
+4. **디버그 렌더링 다형성**: 각 구현체가 `ConstructRenderingComponent()`로 전용 렌더링 컴포넌트 제공.
+5. **경로 관찰/재요청 공통화**: `ActivePaths`/`ObservedPaths` 처리 로직을 베이스에서 단일 구현 → 모든 NavData가 공짜로 재요청 시스템 획득.
+6. **테스트성**: `AAbstractNavData`로 네비 시스템 빈 상태 시뮬레이션 가능.
+
+#### 현재 존재하는 서브클래스
+
 | 클래스 | 파일 | 용도 |
 |--------|------|------|
-| `ARecastNavMesh` | `NavMesh/RecastNavMesh.h:573` | Recast/Detour 기반 메인 구현 |
-| `AAbstractNavData` | `AbstractNavData.h:60` | 테스트/더미용, NavData 없이 쿼리 API만 흉내 |
-| `ANavigationGraph` | `NavGraph/NavigationGraph.h:61` | 그래프 기반 실험적 구현 |
+| `ARecastNavMesh` | `NavMesh/RecastNavMesh.h:573` | Recast/Detour 기반 메인 구현 (사실상 유일한 프로덕션 구현) |
+| `AAbstractNavData` | `AbstractNavData.h:59-100` | 스텁 구현 — 모든 쿼리가 no-op 또는 고정값. 테스트/무네비 환경용 |
+| `ANavigationGraph` | `NavGraph/NavigationGraph.h:60-66` | 그래프 기반 실험적 베이스, 미완성 |
 
-**분리의 실익:**
-- `UNavigationSystemV1`이 구체 타입을 몰라도 쿼리/빌드 라이프사이클을 관리할 수 있음
-- 새 구현체(예: 2D 그리드, 하이브리드 내비)를 추가할 때 베이스 인터페이스만 만족하면 시스템이 그대로 동작
-- 테스트나 무네비 환경에서 `AAbstractNavData`로 교체 가능
+#### 플러그인/커스텀 구현 후보 예시
+
+`ANavigationData`를 상속해서 만들 수 있는 실제 사례들:
+
+1. **2D 그리드 내비** — 2D 탑다운/플랫포머 게임용. 그리드 셀을 노드로, 인접 셀을 엣지로 삼아 A\* 적용. Recast보다 훨씬 가볍고 예측 가능.
+2. **웨이포인트 그래프 내비** — 디자이너가 수동 배치한 웨이포인트 네트워크. MMO나 레이싱 AI 등에서 쓰임. `ANavigationGraph`가 이 방향의 미완성 베이스.
+3. **볼류메트릭/3D 내비** — 날아다니는 AI, 우주 전투, 수중 AI 용 3D 네비 (공식 마켓플레이스의 "Flying AI Extension" 류).
+4. **하이브리드 (Recast + 볼륨)** — 지상 AI는 Recast, 공중 AI는 별도 볼륨. 두 구현체가 같은 월드에 공존.
+5. **Jump Point Search (JPS)** — 그리드 기반 최적화 A\* 변형. 오픈 필드에서 Recast보다 빠른 경로 탐색.
+6. **Flow Field 기반 군중 내비** — 다수 유닛이 같은 목적지로 이동할 때 경로 대신 방향장 사용 (RTS/MOBA류).
+7. **계층적 네비 (HPN, Hierarchical Pathfinding Network)** — 대형 맵을 클러스터로 분할하여 상위 그래프에서 대략적 경로를 구하고 클러스터 내부에서 세부 경로를 구하는 방식.
+
+**플러그인 구현 절차:**
+1. `ANavigationData` 상속 (`UCLASS()`로 마킹, `abstract` 해제)
+2. PURE_VIRTUAL 메서드 전체 구현 (ProjectPoint, GetRandomPoint, BatchRaycast, ...)
+3. 생성자에서 `FindPathImplementation` / `TestPathImplementation` / `RaycastImplementationWithAdditionalResults`에 static 함수 할당
+4. 필요 시 `ConditionalConstructGenerator()` override하여 전용 `FNavDataGenerator` 부착
+5. `UClass*`를 프로젝트 설정 `SupportedAgents[i].NavigationDataClass`에 지정하면 해당 에이전트에는 새 구현체가 스폰됨
 
 > **소스 확인 위치**
-> - `Engine/Source/Runtime/NavigationSystem/Public/NavigationData.h:545` — `ANavigationData` 클래스 선언 (`abstract` 지정)
-> - `Engine/Source/Runtime/NavigationSystem/Public/NavigationData.h:635-728` — 가상 메서드 인터페이스
-> - `Engine/Source/Runtime/NavigationSystem/Public/NavMesh/RecastNavMesh.h:573` — `ARecastNavMesh : public ANavigationData`
-> - `Engine/Source/Runtime/NavigationSystem/Public/AbstractNavData.h:60` — `AAbstractNavData` (대체 구현 예시)
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavigationData.h:545` — `ANavigationData` 선언 (`abstract`)
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavigationData.h:1046-1059` — 함수 포인터 기반 다형성 typedef
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavigationData.h:778-967` — PURE_VIRTUAL 메서드 모음
+> - `Engine/Source/Runtime/NavigationSystem/Private/NavigationData.cpp:285-405` — `TickActor()` 경로 관찰/재요청 처리
+> - `Engine/Source/Runtime/NavigationSystem/Private/NavigationData.cpp:459-768` — `ActivePaths`, `ObservedPaths`, `RepathRequests` 관리
+> - `Engine/Source/Runtime/NavigationSystem/Private/NavigationData.cpp:585-715` — Generator 라이프사이클, `RebuildDirtyAreas` 디스패치
+> - `Engine/Source/Runtime/NavigationSystem/Private/NavigationData.cpp:757-897` — NavArea 레지스트리
+> - `Engine/Source/Runtime/NavigationSystem/Private/NavMesh/RecastNavMesh.cpp:529-535` — 함수 포인터 할당 예시
+> - `Engine/Source/Runtime/NavigationSystem/Public/AbstractNavData.h:59-100` — `AAbstractNavData` 스텁 구현 예시
 
 ## 2. 핵심 클래스 역할
 
