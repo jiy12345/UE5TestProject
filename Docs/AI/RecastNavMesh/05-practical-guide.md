@@ -396,13 +396,14 @@ ANavigationData* NavData = NavSys->GetNavDataForProps(LargeAgentProps);
 FPathFindingQuery Query(this, *NavData, Start, End);
 ```
 
-#### 에이전트가 여러 개면 NavMesh도 여러 개
+#### 에이전트가 여러 개면 NavMesh도 여러 개 — 단, 항상 1:1은 아님
 
-프로젝트 설정의 `Project Settings > Navigation System > Supported Agents`에 **N개의 에이전트를 등록하면, 레벨에는 N개의 `ARecastNavMesh` 액터가 생성됩니다**.
+프로젝트 설정의 `Project Settings > Navigation System > Supported Agents`에 **N개의 에이전트를 등록하면, 레벨에는 최대 N개의 `ARecastNavMesh` 액터가 생성됩니다**. 단 에이전트 프로퍼티가 **tolerance 범위(radius/height 5.0 unit 이내)** 안에서 비슷하면 동일 NavData를 공유합니다.
 
-**소스**: `UNavigationSystemV1::PostInitProperties()` (`NavigationSystem.cpp`)
-- `SupportedAgents` 배열을 순회하면서 각 에이전트에 대해 `CreateNavigationDataInstanceInLevel()` 호출
-- 각 호출이 해당 에이전트 전용 `ARecastNavMesh` 인스턴스를 스폰하고 `NavDataSet`에 등록
+**소스**: `UNavigationSystemV1::SpawnMissingNavigationDataInLevel()` (`NavigationSystem.cpp:4647-4687`)
+- `SupportedAgents` 배열을 순회하면서 **아직 매칭되는 NavData가 없는 에이전트에 대해서만** `CreateNavigationDataInstanceInLevel()` 호출
+- `InInstantiatedMask[AgentIndex]` 체크로 중복 스폰 방지
+- 매칭 판정: `FNavAgentProperties::IsNavDataMatching()` — radius/height 5.0 tolerance
 
 **구조:**
 
@@ -418,11 +419,25 @@ UWorld
 
 **중요한 비용 특성:**
 - 각 `ARecastNavMesh`는 **독립적으로 전체 레벨을 빌드**합니다 (지오메트리는 공유하지만 복셀화/폴리곤 생성은 별도).
-- 따라서 에이전트 수가 늘어나면 **빌드 시간/메모리/디스크 용량이 거의 선형적으로 증가**.
+- 따라서 실제로 스폰되는 NavData 수가 늘어나면 **빌드 시간/메모리/디스크 용량이 거의 선형적으로 증가**.
 - 런타임 경로 쿼리도 에이전트별로 적절한 NavData를 선택해야 함 — `GetNavDataForProps()` 또는 `UNavigationSystemV1::GetNavDataForAgentName()` 사용.
 
+**매핑 예시:**
+```
+SupportedAgents:                실제 스폰되는 NavData:
+  [0] Human  (r=34, h=144)  ┐
+  [1] Enemy  (r=35, h=145)  ├─> 하나의 ARecastNavMesh (tolerance 내)
+  [2] Allied (r=36, h=143)  ┘
+  [3] Mob    (r=100, h=200) ───> 별도 ARecastNavMesh
+  [4] Drone  (r=50, h=80)   ───> 별도 ARecastNavMesh
+
+총 5개 에이전트 → 3개의 NavData 액터 스폰
+```
+
 **실무 권장:**
-- 에이전트는 꼭 필요한 만큼만. 캐릭터의 `AgentRadius`가 비슷하면 하나로 통합하고 카테고리별 NavAreaCost로 구분 가능.
+- 에이전트는 꼭 필요한 만큼만. `AgentRadius`/`AgentHeight`가 5.0 이내면 같은 NavData를 공유하므로 **비슷한 체형은 같은 에이전트로 통합** 불필요.
+- 정말 다른 NavMesh(예: 날아다니는 AI vs 지상 AI)가 필요하면 radius/height를 tolerance 넘게 벌려야 함.
+- 카테고리 구분이 필요하면 NavArea + QueryFilter로 처리 (같은 NavData에서 비용만 다르게).
 - 모든 에이전트가 같은 `TileSizeUU`를 사용하면 타일 그리드가 정렬되어 WP 스트리밍 효율성이 높아짐.
 
 ### 패턴 3: 비동기 경로 요청

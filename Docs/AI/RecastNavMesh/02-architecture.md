@@ -255,8 +255,47 @@ class UNavigationSystemV1 : public UNavigationSystemBase
 
 **에이전트별 NavData 스폰 흐름:**
 1. `PostInitProperties()`가 `SupportedAgents` 배열을 순회
-2. 각 에이전트마다 `CreateNavigationDataInstanceInLevel()`로 `ARecastNavMesh` 스폰
+2. `SpawnMissingNavigationDataInLevel()`에서 각 에이전트에 대해 매칭되는 NavData가 없으면 `CreateNavigationDataInstanceInLevel()`로 신규 스폰
 3. 스폰된 인스턴스를 `RegisterNavData()`로 `NavDataSet`에 등록
+
+**에이전트 ↔ NavData 매핑의 카디널리티:**
+
+1:1이 설계 의도이지만, **실제로는 N:1(여러 에이전트 → 하나의 NavData)이 허용**됩니다. 반대 방향(한 에이전트 → 여러 NavData)은 금지됩니다.
+
+| 시나리오 | 허용? | 근거 |
+|----------|:-----:|------|
+| `SupportedAgents[i]` → NavData 1개 | O | 기본 설계 |
+| `SupportedAgents[i]` → NavData 0개 | O | `SupportedAgentsMask`로 비활성화 또는 레벨에 매칭 NavData 없음 |
+| `SupportedAgents[i]` → NavData 여러 개 | **X** | `RegisterNavData()`가 `RegistrationFailed_AgentAlreadySupported` 반환 |
+| Agent[i] + Agent[j] (유사 radius/height) → 같은 NavData | **O** | Tolerance 매칭 (아래 참조) |
+| 한 에이전트 쿼리 → 여러 NavData 동시 사용 | X | `GetNavDataForProps()`는 단일 인스턴스만 반환 |
+
+**매핑 매커니즘:**
+
+1. **Tolerance 기반 매칭** (`NavigationSystem.cpp:2287-2358`, `NavigationTypes.h:490`)
+   - `FNavAgentProperties::IsNavDataMatching()`이 **5.0 unit 이내 오차**까지 같은 NavData로 간주
+   - `GetNavDataForProps()`: 정확 매칭이 없으면 best-fit(ExcessRadius/ExcessHeight 최소)을 선택
+   - 두 에이전트의 radius/height가 비슷하면 **자동으로 같은 NavData를 공유**
+
+2. **자동 스폰 스킵** (`NavigationSystem.cpp:4647-4687`)
+   - 레벨에 이미 매칭 NavData가 배치돼 있으면 신규 스폰 skip
+   - `SpawnMissingNavigationDataInLevel`에서 `InInstantiatedMask[AgentIndex]` 체크
+
+3. **`FNavAgentSelector` / `SupportedAgentsMask`** — 16비트 마스크로 에이전트별 활성/비활성 제어
+
+4. **등록 시 중복 검증** (`NavigationSystem.cpp:2850-2859`)
+   ```cpp
+   else if (NavDataInstanceForAgent == NavData) {
+       Result = RegistrationSuccessful;  // 동일 NavData 재등록은 허용
+   } else {
+       Result = RegistrationFailed_AgentAlreadySupported;  // 다른 NavData면 거부
+   }
+   ```
+
+**실무 함의:**
+- N개 에이전트 = 반드시 N개 NavData가 아님. 에이전트 프로퍼티가 비슷하면 수가 줄어듦
+- `AgentRadius`가 34, 35, 36인 에이전트 3개 → `IsNavDataMatching()` 5.0 tolerance 덕에 **모두 하나의 NavData를 공유** 가능 (빌드/메모리 크게 절약)
+- 반대로 정말 다른 NavMesh가 필요하면 radius/height를 tolerance 넘게 벌려야 함
 
 **책임 범위:**
 - NavRelevant 오브젝트를 `FNavigationOctree`에 등록/관리
