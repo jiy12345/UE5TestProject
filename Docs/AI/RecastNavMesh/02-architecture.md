@@ -604,7 +604,16 @@ enum class ERuntimeGenerationType : uint8
 | `DynamicModifiersOnly` | 가능 | 부분 (압축 레이어 → 타일 재생성) | O |
 | `Dynamic` | 가능 | 전체 (지오메트리 포함) | O |
 
-`IsGameStaticNavMesh()` (`RecastNavMeshGenerator.cpp:5105`)는 게임 월드 + `Dynamic`이 아닌 경우에 `true`를 반환하며, 이 값이 `MarkDirtyTiles`에서 "지오메트리 Dirty Area는 건너뛰기" 분기의 스위치입니다.
+`IsGameStaticNavMesh()` (`RecastNavMeshGenerator.cpp:5105`)는 **"게임 월드이고, AND, `RuntimeGeneration`이 `Dynamic`이 아닌"** 경우에 `true`를 반환합니다 (두 조건 모두 만족해야 함, `&&` 연산). 즉 PIE/Standalone/Cooked에서 `Static` 또는 `DynamicModifiersOnly` 모드인 NavMesh가 해당. 이 값이 `MarkDirtyTiles`에서 "지오메트리 Dirty Area는 건너뛰기" 분기의 스위치입니다.
+
+```cpp
+// RecastNavMeshGenerator.cpp:5105
+static bool IsGameStaticNavMesh(ARecastNavMesh* InNavMesh)
+{
+    return (InNavMesh->GetWorld()->IsGameWorld() &&               // 조건 1
+            InNavMesh->GetRuntimeGenerationMode() != ERuntimeGenerationType::Dynamic);  // 조건 2
+}
+```
 
 ## 3. 데이터 흐름 다이어그램
 
