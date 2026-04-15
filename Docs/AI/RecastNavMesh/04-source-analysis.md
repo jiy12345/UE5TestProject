@@ -329,7 +329,154 @@ class FNavigationOctree : public TOctree2<FNavigationOctreeElement, FNavigationO
 
 `FRecastTileGenerator::GatherGeometryFromSources()`에서 `FindElementsWithBoundsTest()`로 타일 영역에 포함된 엔트리를 수집합니다 (위 1-4의 수집 기준 참조).
 
-### 2-1. bExcludeLoadedData 필터
+### 2-1. 옥트리의 소유권 모델 — "스냅샷 + 약한 참조"
+
+옥트리는 **NavRelevant 액터/컴포넌트를 직접 소유하지 않습니다**. 스냅샷 데이터만 자기 힙에 보관하고, 원본 UObject에 대해서는 `TWeakObjectPtr` 약한 참조만 가집니다.
+
+#### 소유 구조
+
+```
+FNavigationOctree                          ← UNavigationSystemV1 소유
+  └── TOctree2<FNavigationOctreeElement>
+        └── FNavigationOctreeElement       ← 옥트리가 값으로 보유
+              ├── FBoxSphereBounds Bounds  ← 캐시된 바운딩
+              └── TSharedRef<FNavigationRelevantData> Data   ← 공유 소유
+                    ├── Modifiers (FCompositeNavModifier)    ← 스냅샷
+                    ├── CollisionData                         ← 지오메트리 복사본
+                    ├── NavLinks
+                    └── TSharedRef<FNavigationElement> SourceElement
+                          ├── TWeakObjectPtr<UObject> OwnerUObject   ← 약한 참조!
+                          ├── TWeakObjectPtr<UBodySetup> BodySetup
+                          └── NavigationParent (weak)
+```
+
+**파일 근거:**
+- `NavigationOctree.h:33-56` — `FNavigationOctreeElement`가 `TSharedRef<FNavigationRelevantData>`로 데이터 보유
+- `NavigationRelevantData.h:79` — `TSharedRef<const FNavigationElement> SourceElement`
+- `NavigationElement.h:257-278` — 멤버 전부 `TWeakObjectPtr`
+
+#### 핵심 원칙
+
+**1) 옥트리는 UObject를 소유하지 않음** — 액터가 destroy되면:
+- GC가 정상적으로 수거
+- 옥트리 내 `WeakObjectPtr`는 자동 invalid
+- 옥트리 엔트리는 여전히 잔존 (별도 정리 로직 필요)
+
+**2) 옥트리가 소유하는 건 "스냅샷"** — `FNavigationRelevantData`에 복사된:
+- `CollisionData` (버텍스, 삼각형 인덱스)
+- `Modifiers` (Nav Modifier 정보)
+- `Bounds` (바운딩)
+
+원본 액터가 사라져도 스냅샷은 유지됨.
+
+**3) 원본 라이프사이클은 UWorld/ULevel 소관** — `UWorld`가 액터 배열을 소유, 가비지 컬렉터가 수거. 옥트리는 독립적.
+
+#### 이 설계의 이유
+
+| 이유 | 효과 |
+|------|------|
+| **약한 참조** | 옥트리가 액터를 살려두지 않음 → GC/레벨 스트리밍/순환 참조 문제 없음 |
+| **스냅샷 캐싱** | 쿼리 시 액터 재접근 없이 빠르게 데이터 사용 |
+| **멀티스레드 안전** | `TSharedRef`로 Worker 스레드가 참조 카운트 올리고 안전 읽기 가능 |
+| **원본 액터와 분리** | 비동기 타일 빌드 중 게임 스레드 액터 변경이 Worker 쪽 데이터에 영향 없음 |
+
+### 2-2. 이벤트 기반 동기화 — NavigationSystem이 허브
+
+옥트리는 **수동적(passive) 데이터 구조**입니다. 스스로 액터의 상태 변화를 감지하지 않고, `UNavigationSystemV1`이 엔진 이벤트를 받아서 옥트리에 명령을 내리는 방식으로 동기화됩니다.
+
+#### 옥트리가 반응해야 할 이벤트
+
+| 이벤트 | 필요한 동작 |
+|--------|-------------|
+| 액터 **등록** (BeginPlay, SpawnActor) | 옥트리 엔트리 추가 |
+| 액터 **해제** (Destroy, EndPlay) | 엔트리 삭제 + 과거 바운드 Dirty Area 생성 |
+| 액터 **이동** (SetActorLocation) | 엔트리 재배치 + Dirty Area 2개 (옛/새 바운드) |
+| **컴포넌트 등록/해제** | 엔트리 추가/삭제 |
+| **지오메트리 변경** (스태틱 메시 교체) | 스냅샷 재생성 |
+| **Nav Modifier 변경** (Area Class 교체) | Data만 갱신 |
+| **월드 스트리밍** 로드/언로드 | 대량 엔트리 배치 처리 |
+
+#### 이벤트 파이프라인
+
+```
+[엔진 이벤트 소스]
+    │ UWorld::OnActorRegisteredEvent
+    │ AActor::RegisterAllComponents()
+    │ UActorComponent::OnRegister()
+    │ USceneComponent::OnTransformUpdated
+    │ INavRelevantInterface::UpdateNavigationRelevantData()
+    ▼
+[허브: UNavigationSystemV1]
+    │ OnActorRegistered / OnActorUnregistered
+    │ OnComponentRegistered / OnComponentUnregistered
+    │ UpdateActorInNavOctree / UpdateComponentInNavOctree
+    │ UpdateNavOctreeAfterMove / UpdateNavOctreeBounds
+    ▼ (라우팅)
+┌──────────────────────┬──────────────────────────┐
+▼                      ▼                          ▼
+[FNavigationOctree]    [FNavigationDirtyAreas]    [ANavigationData]
+ 엔트리 add/remove/move  Dirty Area 누적           RebuildDirtyAreas
+```
+
+#### INavRelevantInterface — 네비 연관성 선언
+
+```cpp
+// NavRelevantInterface.h
+class INavRelevantInterface
+{
+    virtual void GetNavigationData(FNavigationRelevantData& Data) const;
+    virtual FBox GetNavigationBounds() const;
+    virtual bool IsNavigationRelevant() const;
+    virtual UObject* GetNavigationParent() const;
+};
+```
+
+액터/컴포넌트가 이 인터페이스를 구현하면 NavigationSystem이 등록 시점에 옥트리에 반영합니다.
+
+#### 이벤트 누락 시 증상
+
+**1) 엔트리 누락 (월드에 있지만 옥트리엔 없음)**
+- 타일 빌드 시 해당 지오메트리 무시 → 네비메시 누락 영역 발생
+- 증상: 벽이 있는데 AI가 통과
+
+**2) 엔트리 잔존 (월드에서 사라졌지만 옥트리에 남음)**
+- `TWeakObjectPtr` invalid → 접근 시 skip되지만 **스냅샷 Data는 유효**
+- 증상: 부숴진 벽인데 AI가 여전히 우회
+- 해결: 주기적 정리 로직 / `ApplyAreaChangesAndUpdateNavOctree`
+
+**3) Bounds 불일치 (이동했지만 옥트리엔 옛 위치)**
+- 공간 질의가 엉뚱한 타일에 속한 것처럼 계산
+- 증상: 액터를 옮겼는데 네비메시가 그대로
+- 해결: `UpdateNavOctreeAfterMove` 호출 보장
+
+#### 대안 방식과의 비교
+
+| 방식 | 장점 | 단점 |
+|------|------|------|
+| **이벤트 기반 (현재)** | 변경 시점에만 갱신, 즉각 반영, 효율적 | 이벤트 누락 시 조용히 불일치 |
+| Polling (매 틱 전수 스캔) | 단순, 누락 없음 | O(n) 매 프레임 = 성능 낭비 |
+| Lazy (쿼리 시 재확인) | 등록 비용 없음 | 쿼리마다 느림 |
+
+엔진은 **이벤트 기반**을 택했고, 결과적으로 옥트리가 "NavigationSystem의 명령에 반응하는 인덱스"가 되었습니다.
+
+#### 세 가지 원칙의 종합
+
+옥트리 아키텍처는 세 가지가 맞물려 있습니다:
+
+1. **소유 안 함 (Weak Ref)** → 라이프사이클 간섭 없음, GC/스트리밍 자유
+2. **스냅샷 보유** → 빠른 쿼리, 멀티스레드 안전
+3. **이벤트 구독** → 실제 상태와 동기화 유지
+
+이 중 하나라도 빠지면 구조가 깨집니다. 예를 들어 이벤트 없이 스냅샷만 있으면 **갱신 안 되는 고정 사본**이 되고, 스냅샷 없이 weak ref만 있으면 **매 쿼리마다 원본 재접근 필요**해서 성능 저하.
+
+> **소스 확인 위치**
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavigationOctree.h:33-56,172` — `FNavigationOctreeElement`, `FNavigationOctree`
+> - `Engine/Source/Runtime/Engine/Classes/AI/Navigation/NavigationRelevantData.h:79` — `SourceElement` SharedRef
+> - `Engine/Source/Runtime/Engine/Classes/AI/Navigation/NavigationElement.h:257-278` — 전부 `TWeakObjectPtr`
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavigationSystem.h` — `OnActorRegistered`, `UpdateActorInNavOctree`, `UpdateNavOctreeAfterMove`
+> - `Engine/Source/Runtime/Engine/Classes/AI/Navigation/NavRelevantInterface.h` — `INavRelevantInterface`
+
+### 2-3. bExcludeLoadedData 필터
 
 **파일**: `Engine/Source/Runtime/NavigationSystem/Public/NavigationRelevantData.h:26`
 
