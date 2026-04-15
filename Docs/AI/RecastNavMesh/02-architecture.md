@@ -774,42 +774,170 @@ dtNavMesh::addTile() / removeTile()
 | `dtNavMeshQuery` 경로 쿼리 | 각 스레드마다 독립 인스턴스 |
 | 배치 쿼리 (`BeginBatchQuery`) | 주로 Game Thread |
 
-### 5-2. 쿼리 중 타일 수정 동기화
+### 5-2. 쿼리 ↔ 수정 동기화 모델
 
-타일 Add/Remove는 **반드시 게임 스레드**에서만 일어납니다 (`AddGeneratedTilesAndGetUpdatedTiles()`). 이 제약 덕분에 `dtNavMesh` 자체를 감싸는 명시적 락(FRWLock 등)은 사용되지 않습니다. 대신 두 가지 메커니즘으로 동기화합니다:
+`ARecastNavMesh`는 **명시적 락(FRWLock, FCriticalSection 등)을 사용하지 않습니다**. 실제 동기화 모델은 스레드 유형에 따라 다릅니다.
 
-**1. 게임 스레드 단독 수정:**
-비동기 빌드는 Worker에서 복셀화/폴리곤 생성까지만 수행하고, 결과를 게임 스레드로 복귀시킨 뒤 `dtNavMesh`에 반영. 쿼리 호출도 통상 게임 스레드이므로 경합이 없음.
+#### 5-2-1. 게임 스레드: 순차 실행 (경합 없음)
 
-**2. `BatchQueryCounter` — 비동기 쿼리 보호:**
+```
+Tick(frame N):
+  AIController A::Tick → FindPath (쿼리)     ┐
+  AIController B::Tick → FindPath (쿼리)     │ 순차 실행
+  NavSys::Tick → Generator::TickAsyncBuild   │ 락 없음
+    └─ AddGeneratedTilesAndGetUpdatedTiles   │ 경합 없음
+  AIController C::Tick → FindPath (쿼리)     ┘
+```
+
+- 쿼리와 수정이 **같은 게임 스레드**에서 실행 → 동시 접근 불가능
+- "쿼리 중에는 수정을 미룬다" 같은 블로킹 **없음**. 그냥 순차적으로 들어온 순서대로 실행
+- 프레임 안에서 자연스럽게 인터리브됨
+
+#### 5-2-2. `BatchQueryCounter` — 블로킹 아님, 추적용 필드
 
 **파일**: `RecastNavMesh.cpp:1312-1329`
 
 ```cpp
-void ARecastNavMesh::BeginBatchQuery() const
-{
+void ARecastNavMesh::BeginBatchQuery() const {
 #if RECAST_ASYNC_REBUILDING
     if (BatchQueryCounter <= 0) { BatchQueryCounter = 0; }
     BatchQueryCounter++;
 #endif
 }
+```
 
-void ARecastNavMesh::FinishBatchQuery() const
-{
-#if RECAST_ASYNC_REBUILDING
-    BatchQueryCounter--;
-#endif
+**엔진 전체를 검색해도 `BatchQueryCounter`를 읽어서 타일 업데이트를 막는 코드는 존재하지 않습니다**. `AddGeneratedTilesAndGetUpdatedTiles()`, `ProcessTileTasksAsyncAndGetUpdatedTiles()` 모두 카운터와 무관하게 그냥 실행.
+
+역할 추정:
+1. 레거시 — 과거에 블로킹 용도였다가 구현이 바뀌면서 카운터만 남음
+2. 서브클래스/플러그인이 override해서 자체 로직 삽입하도록 남긴 훅
+3. 디버그/프로파일링 추적 필드
+
+즉 `BeginBatchQuery`/`FinishBatchQuery`의 실질적 효과는 **거의 없음**. 호출해도 블로킹 없고, 호출 안 해도 동작에 영향 없음.
+
+#### 5-2-3. 비동기 쿼리 (Worker Thread): "Best Effort + 사후 탐지"
+
+`FindPathAsync`는 Worker 스레드에서 실행됩니다. 이때 게임 스레드가 `addTile()`/`removeTile()`을 호출할 수 있어 **진짜 경합 가능성**이 있는데, 엔진의 접근법은:
+
+**쿼리 중에는 유효성 검사 안 함** (성능 이유 — A\*에서 수만 번의 노드 탐색에 매번 validation = 불가능).
+
+대신 3단계 방어:
+
+**방어 1: Detour 내부 메모리 안전**
+- `addTile()`: 새 메모리 할당, 기존 타일 포인터 건드리지 않음 → 안전
+- `removeTile()`: 타일 제거 + salt 증가. 메모리 즉시 free 안 함 (pool 반환) → 짧은 윈도우 동안은 stale 데이터 읽을 수 있지만 crash 안 남. 단 같은 메모리가 재할당되면 이론적 race 가능 (실무적으로 드뭄)
+
+**방어 2: `dtPolyRef`의 salt 비트**
+```
+dtPolyRef = [salt: 16bit][tileIdx: 22bit][polyIdx: 20bit]
+```
+타일 remove 시 salt 증가. 쿼리 결과로 나온 `dtPolyRef`를 나중에 쓸 때 `isValidPolyRef()`가 salt 불일치를 감지 → 무효 판정.
+
+**방어 3: Path Observation 시스템 (사후 탐지)**
+
+쿼리 완료 후 경로는 `ANavigationData::ActivePaths`에 등록되고, 베이스 클래스의 `TickActor()`가 **매 틱 유효성을 검증**:
+
+```cpp
+// NavigationData.cpp:285-405 (개념적)
+for (FNavPathWeakPtr& ActivePath : ActivePaths) {
+    if (!ActivePath->IsValid())
+        RequestRePath(ActivePath, ENavPathUpdateType::NavigationChanged);
 }
 ```
 
-비동기 경로 쿼리나 여러 개의 쿼리를 묶어 수행할 때 `BeginBatchQuery()`로 카운터를 올려, 타일 통합 로직이 해당 구간 동안 수정을 보류합니다. 카운터가 0이 되면 대기 중인 타일 Add가 처리됩니다.
+즉 **"쿼리 중에는 검증 안 함, 결과 사용 시점에 검증 + 무효면 재요청"** 하는 eventual consistency 모델.
 
-**주의사항:**
-- `dtNavMeshQuery` 인스턴스는 **스레드마다 독립**이어야 함. 게임 스레드는 `FPImplRecastNavMesh::SharedNavQuery` 재사용, 비동기 쿼리는 별도 인스턴스 생성
-- 쿼리 중 `removeTile()`이 호출되면 `dtPolyRef`의 salt가 무효화되어 `isValidPolyRef()`가 false 반환 — 호출 측에서 체크 필요
+```
+[Worker Thread]                        [Game Thread]
+FindPathAsync 시작
+  ├ tile A 읽기
+  ├ tile B 읽기                         removeTile(tile C)  ← 변경 발생
+  ├ tile C 읽기 (stale 가능)
+  ├ A* 탐색 계속
+FindPathAsync 완료
+  → FNavMeshPath 결과 반환
+
+     ↓ (게임 스레드로 전달)
+
+Path를 ActivePaths에 등록
+  → 매 틱 IsValid() 검증
+     → Invalid 시 RequestRePath → 재계산
+```
+
+### 5-3. 설계 가정과 한계 (스톨 / 기아 / 수렴 실패)
+
+위 메커니즘은 **"네비메시 수정은 드문 이벤트(event)지 매 프레임 일어나는 연속 작업이 아니다"** 라는 암묵적 가정 위에 얹혀 있습니다.
+
+#### 5-3-1. 가정이 깨질 때 발생하는 문제
+
+수정 빈도가 매우 높으면 ("매 프레임 다수의 NavRelevant 액터 이동" 같은 상황):
+
+**1. 경로 수렴 실패 (Thrashing)**
+```
+쿼리 A 시작 → 수정 → 쿼리 A 완료 (stale) → 재요청 B
+쿼리 B 시작 → 수정 → 쿼리 B 완료 (stale) → 재요청 C
+...
+```
+완성된 경로가 계속 무효화되어 AI가 한 발자국도 못 나감. 엄밀한 의미의 starvation은 아니지만 실질적으로 진전 없음.
+
+**2. `RepathRequests` 큐 적체**
+모든 `ActivePath`가 매 틱 무효화 → repath 큐 팽창 → 처리 속도 < 생성 속도 → 백로그 증가.
+
+**3. CPU 포화**
+경로 N개 × `findPath` 비용(수 ms) × 60 FPS → 게임 스레드 시간 초과 → 프레임 드랍.
+
+**4. `PendingDirtyTiles` 역류**
+프레임당 `NumTasksToProcess` 제한으로 타일 처리 수가 캡됨 → dirty 생성 속도가 처리 속도 넘으면 무한 적체.
+
+#### 5-3-2. 엔진이 제공하는 완화책 (있지만 제한적)
+
+| 메커니즘 | 효과 | 한계 |
+|----------|------|------|
+| `DynamicModifiersOnly` 모드 | 압축 레이어 경로로 재생성 빠름 | 지오메트리 자체 수정 불가 |
+| `TickAsyncBuild`의 `NumTasksToProcess` 상한 | 프레임당 타일 처리 수 제한 | 적체 자체는 못 막음 |
+| **Navigation Invoker** | 활성 타일만 유지 → 수정 범위 축소 | 활성 영역 내 수정은 여전히 무제한 |
+| `SuspendedDirtyAreas` | 일시 중단 가능 | 수동 제어 필요 |
+| `EnsureBuildCompletion()` | 동기 대기로 상태 안정화 | 게임 스레드 블로킹, 컷신 등 특수 상황용 |
+
+**결정적으로 빠진 것:**
+- 연속 수정으로부터 쿼리를 보호하는 **자동 스로틀**
+- Repath 루프 감지 / 빈도 제한
+- 비동기 쿼리 우선순위 관리
+
+#### 5-3-3. 실무 가이드라인
+
+**엔진 설계 가정에 부합 (잘 동작):**
+- 정적 월드 + 가끔의 이벤트성 변경 (문 열림, 폭발로 인한 지형 변경 등)
+- 월드 파티션 스트리밍 (청크 단위 전환)
+- `Dynamic` 대신 `DynamicModifiersOnly` + NavModifier 볼륨 활용
+
+**가정을 깨는 위험한 패턴:**
+- **매 프레임 움직이는 NavRelevant 액터** — 특히 RTS 유닛 다수
+- **런타임 파괴 가능 지형** — 프레임마다 벽 조금씩 깎기
+- **대량 AI + 동적 장애물 조합** — 모두 Dirty Area 생성
+- **Nav Modifier를 매 프레임 토글**
+
+UE 공식 베스트 프랙티스도 **"동적 오브젝트는 NavRelevant로 하지 말고 Avoidance 시스템(RVO/Detour Crowd)을 써라"** 고 권장. 네비메시는 "정적 세계 + 이벤트 기반 변경"만 감당하도록 설계됨.
+
+#### 5-3-4. 근본 원인: Recast의 태생
+
+Recast/Detour (Mikko Mononen, 2009~) 원천 설계가 **"사전 베이크된 정적 네비메시"** 를 상정. UE가 Dynamic 모드까지 확장했지만, 알고리즘 자체가 동적 시나리오 최적화되어 있지 않음.
+
+다른 내비 패러다임과의 트레이드오프:
+
+| 방식 | 쿼리 성능 | 수정 성능 | 연속 변경 내성 | 적합 |
+|------|:---------:|:---------:|:-------------:|------|
+| Recast/Detour | 우수 | 보통~나쁨 | **약함** | FPS, RPG (정적 월드) |
+| Grid A\* | 보통 | 우수 | 강함 | 2D, 타일 기반 |
+| Flow Field | 다수 유닛에 우수 | 보통 | 보통 | RTS, 동시 이동 |
+| JPS | 매우 우수 | 우수 | 강함 | 오픈 필드 그리드 |
+
+극단적 동적 환경이 필요하면 Recast 대신 이런 대체 구현(`ANavigationData` 서브클래스로 플러그인화 가능, 이슈 #14 참조)을 고려해야 함.
 
 > **소스 확인 위치**
-> - `Engine/Source/Runtime/NavigationSystem/Public/NavMesh/RecastNavMesh.h:1285-1289` — `BeginBatchQuery()` / `FinishBatchQuery()` 선언
-> - `Engine/Source/Runtime/NavigationSystem/Private/NavMesh/RecastNavMesh.cpp:1312-1329` — 배치 쿼리 구현
-> - `Engine/Source/Runtime/NavigationSystem/Private/NavMesh/RecastNavMeshGenerator.cpp:6366` — `AddGeneratedTilesAndGetUpdatedTiles()` (게임 스레드)
+> - `Engine/Source/Runtime/NavigationSystem/Public/NavMesh/RecastNavMesh.h:1285-1289,1576` — `BeginBatchQuery()` / `FinishBatchQuery()` / `BatchQueryCounter` 선언
+> - `Engine/Source/Runtime/NavigationSystem/Private/NavMesh/RecastNavMesh.cpp:1312-1329` — 배치 쿼리 구현 (블로킹 없음)
+> - `Engine/Source/Runtime/NavigationSystem/Private/NavMesh/RecastNavMeshGenerator.cpp:6366,6936` — `AddGeneratedTilesAndGetUpdatedTiles()` / `ProcessTileTasksAsyncAndGetUpdatedTiles()` — 카운터 무시하고 실행
+> - `Engine/Source/Runtime/NavigationSystem/Private/NavigationData.cpp:285-405` — `TickActor()` 경로 유효성 검증 및 repath
+> - `Engine/Source/Runtime/Navmesh/Public/Detour/DetourNavMesh.h` — `dtPolyRef` salt 비트 레이아웃, `isValidPolyRef()`
 > - `Engine/Source/Runtime/NavigationSystem/Private/NavMesh/PImplRecastNavMesh.cpp:40` — `SharedNavQuery` 게임 스레드 제약
