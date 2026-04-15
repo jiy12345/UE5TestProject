@@ -717,23 +717,63 @@ ENavigationDirtyFlag FNavigationRelevantData::GetDirtyFlag() const
 }
 ```
 
-### 6-1. 각 플래그의 의미와 효과
+### 6-1. 각 플래그의 의미와 RuntimeGeneration 모드별 처리
 
-| 플래그 | 의미 | 주요 발생 상황 | `DynamicModifiersOnly`에서의 처리 |
-|--------|------|----------------|------------------------------------|
-| `None` (0) | 변경 없음 | 무의미한 Dirty | skip |
-| `Geometry` (1) | 지오메트리 변경 — 복셀 재래스터화 필요 | 액터 이동, 콜리전 변경, `FillCollisionUnderneathForNavmesh`/`NavMeshResolution` 설정된 Modifier 등록 | **skip** (IsGameStaticNavMesh 필터) |
-| `DynamicModifier` (2) | Nav Modifier만 변경 — 압축 레이어 경로 가능 | NavModifierVolume, NavModifierComponent의 등록/해제/AreaClass 변경 | **처리** |
-| `UseAgentHeight` (4) | 에이전트 높이 필터 적용 필요 | Modifier에 `bIncludeAgentHeight=true` 설정 | Modifier와 함께 처리 |
-| `NavigationBounds` (8) | 네비메시 경계 변경 | `ANavMeshBoundsVolume` 이동/추가/제거 | **skip** (IsGameStaticNavMesh는 bounds 변경은 전체 재빌드 경로이므로 배제) |
+아래 표는 `MarkDirtyTiles` 필터(`RecastNavMeshGenerator.cpp:6589`)와 `bRebuildGeometry` 판정(라인 6672), 그리고 Generator 생성 조건(`RecastNavMesh.cpp:3877`)을 종합해 **실제 동작**을 정리한 것입니다.
 
-### 6-2. 플래그 조합 시나리오
+| 플래그 | 의미 | 주요 발생 상황 | `Static` (게임) | `DynamicModifiersOnly` (게임) | `Dynamic` (게임) | 에디터 (어느 모드든) |
+|--------|------|----------------|:---------------:|:-----------------------------:|:----------------:|:--------------------:|
+| `None` (0) | 변경 없음 | 무의미한 Dirty | **N/A** (Generator 없음) | skip (필터) | no-op | no-op |
+| `Geometry` (1) | 지오메트리 변경 (복셀 재래스터화) | 액터 이동, 콜리전 변경 | **N/A** | **skip** (필터: DynamicModifier flag 없음) | **처리** (전체 재빌드, `bRebuildGeometry=true`) | 처리 (전체 재빌드) |
+| `DynamicModifier` (2) | Modifier만 변경 | NavModifierVolume 등록/AreaClass 변경 | **N/A** | **처리** (압축 레이어 경로, `bRebuildGeometry=false`) | **처리** (전체 재빌드) | 처리 |
+| `Geometry \| DynamicModifier` | 둘 다 | `FillCollisionUnderneathForNavmesh` 또는 `NavMeshResolution` 설정된 Modifier | **N/A** | **처리** (Modifier만 적용, Geometry 부분 silent drop) | **처리** (전체 재빌드) | 처리 |
+| `UseAgentHeight` (4) | 에이전트 높이 필터 | Modifier `bIncludeAgentHeight=true` | **N/A** | 동반 플래그와 함께 처리 | 동반과 함께 처리 | 처리 |
+| `NavigationBounds` (8) | 경계 변경 | `ANavMeshBoundsVolume` | **N/A** | **skip** (필터: NavigationBounds가 우선) | **처리** (전체 재빌드) | 처리 |
+| `DynamicModifier \| NavigationBounds` | 경계 + Modifier | Bounds 볼륨이 Modifier 겸함 | **N/A** | **skip** (필터: NavigationBounds가 우선) | **처리** | 처리 |
 
-- **순수 Nav Modifier Volume 이동** → `DynamicModifier`만 → 정상 처리
-- **Modifier에 `FillCollisionUnderneathForNavmesh=true`** → `Geometry | DynamicModifier` → **skip** (Geometry 플래그가 있으면 `DynamicModifiersOnly`에서 무시됨!)
-- **Modifier에 `NavMeshResolution` 변경** → `Geometry | DynamicModifier` → skip
+### 6-2. 범례
 
-**실무 주의사항**: `DynamicModifiersOnly` 모드로 런타임 Modifier를 쓴다면 `FillCollisionUnderneathForNavmesh`, `NavMeshResolution` 옵션은 피해야 합니다. 이 옵션들은 내부적으로 `Geometry` 플래그를 붙여 런타임 업데이트를 막습니다.
+**"N/A (Generator 없음)"**
+Static 모드 + 게임 월드에서는 `bRequiresGenerator = SupportsRuntimeGeneration() || !IsGameWorld()` 가 false → `FRecastNavMeshGenerator` 자체가 construct되지 않음. `MarkDirtyTiles`도 호출되지 않음. **Dirty가 생성되더라도 처리할 주체가 없어 흘러가 버림** — "필터로 막는" 게 아니라 구조적 부재.
+
+**"skip (필터)"**
+`bGameStaticNavMesh && (!HasFlag(DynamicModifier) || HasFlag(NavigationBounds))` 조건 만족 → `continue` 로 스킵 (`RecastNavMeshGenerator.cpp:6589`).
+
+**"처리 (압축 레이어 경로)"**
+필터 통과 + `bRebuildGeometry=false` → 압축 타일 캐시(`CompressedTileCacheLayers`)에서 복원하여 `MarkDynamicAreas()`로 Modifier만 재적용. 복셀 재래스터화 생략.
+
+**"처리 (전체 재빌드)"**
+필터 통과 + `bRebuildGeometry=true` → 지오메트리 수집부터 복셀화까지 전체 Recast 파이프라인 실행.
+
+**"silent drop"**
+`Geometry | DynamicModifier` 조합에서 `bGameStaticNavMesh=true`이면 필터는 통과하지만 `bRebuildGeometry=false` → Modifier 부분만 압축 레이어 경로로 처리되고 **Geometry 부분은 아무 로그/경고 없이 무시됨**. `FillCollisionUnderneathForNavmesh` 같은 가상 지오메트리 효과가 런타임에 반영되지 않는 부작용 — 에디터와 런타임 동작 차이의 원인.
+
+### 6-3. 모드별 핵심 동작 요약
+
+**Static (게임 월드)**
+- Generator 자체가 construct되지 않음 → 어떤 Dirty도 런타임 처리 안 됨
+- 완전 정적 네비메시, 모든 변경 무시
+
+**DynamicModifiersOnly (게임 월드)**
+- Generator 존재, 필터 활성화
+- `DynamicModifier` flag만 있는 dirty → 압축 레이어 경로로 처리
+- `Geometry` 단독, `NavigationBounds` 포함 dirty → skip
+- `Geometry | DynamicModifier` 조합 → Modifier 부분만 처리, Geometry 부분 silent drop
+
+**Dynamic (게임 월드)**
+- Generator 존재, 필터 비활성화 (`bGameStaticNavMesh=false`)
+- 모든 flag 처리 (전체 재빌드 경로)
+
+**에디터 (어느 모드든)**
+- `IsGameWorld=false` → `bGameStaticNavMesh=false` → 필터 skip
+- 모든 Dirty 처리 — 에디트 편의성 보장
+
+### 6-4. 실무 주의사항
+
+- **Static 모드에서 "왜 런타임에 아무것도 반영 안 되지?"**: Generator 자체가 없어서. 설계대로 동작하는 것.
+- **`DynamicModifiersOnly` + `FillCollisionUnderneathForNavmesh`**: 필터는 통과하지만 Geometry 부분 silent drop으로 완전 반영 안 됨. 이 옵션은 `Dynamic` 모드에서만 런타임 업데이트 가능. `DynamicModifiersOnly`에서는 에디터 bake 결과만 유지하고 런타임 변경 시도하지 말 것.
+- **`DynamicModifiersOnly` + `NavMeshResolution` 변경**: 동일한 이유로 런타임 반영 안 됨.
+- **에디터에서 테스트 → 런타임 동작 다름**: 에디터는 `bGameStaticNavMesh=false`라 모든 dirty 처리. 런타임은 모드에 따라 필터됨. **PIE에서 반드시 재현 테스트 필요** (PIE는 `IsGameWorld=true`).
 
 > **소스 확인 위치**
 > - `Engine/Source/Runtime/NavigationSystem/Public/NavigationDirtyArea.h:12-20` — `ENavigationDirtyFlag` 열거형
