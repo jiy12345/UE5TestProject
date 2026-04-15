@@ -373,6 +373,118 @@ class FPImplRecastNavMesh
 };
 ```
 
+#### "Detour 타입을 헤더에서 격리"의 의미
+
+`ARecastNavMesh`의 **공개 헤더**(`Public/NavMesh/RecastNavMesh.h`)는 `class FPImplRecastNavMesh;` 전방 선언과 포인터 멤버 하나만 가집니다. Detour 헤더(`DetourNavMesh.h` 등)는 공개 API 어디에도 등장하지 않고, **Private 폴더의 `PImplRecastNavMesh.h/.cpp`에서만 include**됩니다.
+
+| 파일 | Detour 타입 보임? |
+|------|:-----------------:|
+| `Public/NavMesh/RecastNavMesh.h` | **X** (전방 선언만) |
+| `Private/NavMesh/PImplRecastNavMesh.h` | O |
+| `Private/NavMesh/PImplRecastNavMesh.cpp` | O |
+| 게임 코드, 다른 모듈 | **X** (공개 헤더만 include하므로) |
+
+**이 격리의 효과:**
+- 게임 코드가 `RecastNavMesh.h`를 include해도 Detour 헤더가 전파되지 않음 → 빌드 속도
+- 공개 API에 Detour 심볼(`dtNavMesh`, `dtPoly` 등) 노출 안 됨 → 네임스페이스/ABI 보호
+- Detour 내부 구조 변경이 `RecastNavMesh.h` 의존 파일들로 전파되지 않음
+
+#### 전방 선언으로는 안 되는가?
+
+사실 "Detour 헤더 격리" 목적만 놓고 보면 **개별 전방 선언 + 포인터 멤버 + .cpp에서 include** 방식으로도 대부분 달성 가능합니다. 컴파일 방화벽 효과는 동일하죠:
+
+```cpp
+// 가상의 전방 선언 방식 (PIMPL 없이)
+class dtNavMesh;
+class dtNavMeshQuery;
+
+class ARecastNavMesh
+{
+    dtNavMesh*      DetourMesh;      // 포인터 = 전방 선언 OK
+    dtNavMeshQuery* SharedQuery;     // 포인터 = 전방 선언 OK
+    // ...
+};
+```
+
+그런데도 PIMPL을 채택한 **실질적 이유**는 다음 조합:
+
+**1) 값 멤버를 쓸 수 없음 (결정적 기술 제약)**
+
+```cpp
+class dtNavMeshQuery;  // 전방 선언
+dtNavMeshQuery Query;  // ✗ 불가 — 크기 모르면 embed 못 함
+dtNavMeshQuery* Query; // ✓ 가능하지만 별도 힙 할당 강제
+```
+
+실제 `FPImplRecastNavMesh`는 `dtNavMeshQuery`를 **값**으로 보유합니다. 전방 선언 방식이면 포인터로 바꿔야 하고, 그러면 별도 `new`/`delete` 관리와 힙 할당이 추가됨.
+
+**2) Nullptr 상태 공간 폭발**
+
+포인터 멤버 N개 = 이론적으로 2^N가지 null 조합. 메서드마다 개별 null 체크:
+
+```cpp
+void FindPath(...) {
+    if (!DetourMesh)    return Fail;
+    if (!SharedQuery)   return Fail;
+    if (!TileCache)     return Fail;
+    // ... 체크 N번
+}
+```
+
+PIMPL이면 `if (!Impl) return Fail;` 한 번으로 끝. 내부 멤버들의 일관성은 `FPImplRecastNavMesh` 생성자가 보장.
+
+**3) 부분 초기화/예외 안전성**
+
+```cpp
+// 전방 선언 방식 생성자
+ARecastNavMesh() {
+    DetourMesh   = new dtNavMesh();       // 성공
+    SharedQuery  = new dtNavMeshQuery();  // 성공
+    TileCache    = new dtTileCache();     // throw!
+    // → 앞 두 개 누수. 소멸자도 호출 안 됨 (C++ 표준)
+}
+```
+
+PIMPL은 `new FPImplRecastNavMesh()` **한 번**. 성공하거나 실패하거나 이분법 → 예외 안전.
+
+**4) 캡슐화 완전성**
+
+```cpp
+// 전방 선언 방식 — 서브클래스가 내부 상태 직접 조작 가능
+class AMyCustomNavMesh : public ARecastNavMesh {
+    void Hack() { DetourMesh->removeAllTiles(); }  // 우회 조작
+};
+```
+
+PIMPL은 `Impl`이 **불투명 타입** — 외부에서 포인터만 보이고 내부 멤버/메서드는 알 수 없음. 서브클래스·friend도 우회 불가.
+
+**5) 불변 조건(Invariant) 유지**
+
+"`TileCache`와 `DetourMesh`는 항상 같은 타일 그리드 설정이어야 한다" 같은 규칙을 enforce하려면, 상태가 한 클래스에 묶여 있어야 공통 setter에서 검증 가능. 상태가 `ARecastNavMesh` 여기저기 흩어지면 sync가 깨질 지점이 많아짐.
+
+**6) 거대 로직의 물리적 분리 (가장 큰 실질 이득)**
+
+`PImplRecastNavMesh.cpp`는 실제로 **3000줄+** 의 Detour 통합 코드. 전방 선언 방식이면 이 전부가 `RecastNavMesh.cpp`에 들어가야 함 → UE 레이어 로직과 Detour 레이어 로직이 한 파일에 섞이면서 유지보수 난이도 폭발.
+
+**7) 할당 통합 / 캐시 지역성** (부수 효과)
+
+값 멤버들이 임플 할당 한 블록에 embed → 힙 할당 횟수 감소 + 멤버 접근 시 같은 캐시 라인.
+
+#### 정리
+
+| 목적 | 전방 선언만 | PIMPL |
+|------|:-----------:|:-----:|
+| Detour 헤더 격리 (빌드 방화벽) | O | O |
+| 값 멤버 사용 | **X** | O |
+| Null 상태 공간 축소 | X | O |
+| 예외 안전 생성/소멸 | 어려움 | 쉬움 |
+| 완전한 캡슐화 (내부 불투명) | X | O |
+| 불변 조건 한 곳 관리 | 어려움 | 쉬움 |
+| 거대 로직 파일 분리 | X | O |
+| 할당 통합 | X | O |
+
+**컴파일 방화벽만 필요**하면 전방 선언으로 충분하지만, **값 멤버 + 복잡한 내부 상태 + 수천 줄 로직**이 결합되면 PIMPL이 명백히 우세합니다. `ARecastNavMesh`는 정확히 후자의 케이스. 엔진 TODO 주석의 "합쳐도 된다"는 **Detour 외 구현이 없어 #1(교체 유연성)이 의미 없어졌다**는 맥락이지, 나머지 기술적 이유는 여전히 유효합니다.
+
 ### 2-4. dtNavMesh — 타일 그래프 데이터 (Detour)
 
 **파일**: `Engine/Source/Runtime/Navmesh/Public/Detour/DetourNavMesh.h:502`
