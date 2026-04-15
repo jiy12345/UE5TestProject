@@ -632,16 +632,26 @@ bool IsInBaseNavmesh(const UObject* Object)
 - 해당 DataLayer가 `BaseNavmeshDataLayers`에 **없으면** → 시나리오 C → Dirty 정상 처리
 - `BaseNavmeshDataLayers`에 **있으면** → 시나리오 A → Dirty 무시 (이미 Base에 반영되었다고 가정)
 
-**시나리오 C — Non-WP 월드, 레벨 스트리밍으로 Modifier 등장/소멸:**
-- `bUseWorldPartitionedDynamicMode = false` → 필터 자체가 skip
-- 모든 visibility 변경 dirty가 정상 처리됨
-- **단, 이후 `MarkDirtyTiles()` 단에서 `IsGameStaticNavMesh()` 필터에 걸림** (5번 절 참조). `DynamicModifiersOnly` 모드여도 `DynamicModifier` 플래그가 붙어야 통과
+**시나리오 C — Non-WP 월드, DataLayer 설정 안 된 Modifier가 레벨 스트리밍으로 등장/소멸:**
+- `bUseWorldPartitionedDynamicMode = false` → `IsInBaseNavmesh` 기반 필터 자체가 skip
+- 모든 visibility 변경 dirty가 그대로 전달됨
+- 이후 `MarkDirtyTiles()` 단에서 `IsGameStaticNavMesh()` 필터를 만나지만, **`DynamicModifier` flag는 통과** → 타일 재빌드 발생
+- **※ 이 시나리오의 구조적 비효율:**
+  - Non-WP 네비메시는 persistent level에 속한 단일 글로벌 에셋 — 게임 시작 시 **이미 전부 로드**됨
+  - 에디트 시점에 해당 Modifier가 서브레벨에 있었고 bake 시 visible이었다면, **baked 타일에 이미 Modifier 효과 반영됨**
+  - 런타임에 서브레벨이 스트리밍되며 Modifier 액터가 재등록되어도 **네비메시는 이미 해당 Modifier를 반영한 상태**
+  - 따라서 이때 생성되는 dirty와 뒤따르는 타일 재빌드는 **"같은 결과를 다시 만드는 작업"** — 아키텍처적으로 불필요
+  - 엔진에 `bIsFromVisibilityChange` 플래그는 존재하고 WP 경로에서는 `BaseNavmeshDataLayers` 기반 스킵에 활용되지만, **Non-WP 경로에서는 활용되지 않음**
+- **실무 영향**: WP 월드 + Non-WP 네비메시 조합(장거리 자동 이동이 필요해 흔히 선택됨) + Modifier 다수 배치 시 스트리밍 빈도에 비례한 프레임 스파이크 원인. 투자 대비 효과가 큰 최적화 여지 존재 (#15 참조).
 
 **시나리오 D — Non-WP + 런타임 스폰된 NavModifierVolume:**
 - visibility 변화가 아니라 컴포넌트 등록/해제 이벤트 → `OctreeUpdate_Modifiers` → `DynamicModifier` flag
 - `DynamicModifiersOnly` 모드에서 **정상 처리** — 이것이 의도된 기본 사용 방식
+- 시나리오 C와 달리 이 경우는 "baked에 없던 것이 새로 추가"되는 것이므로 dirty 처리가 **정당**
 
-**요약**: DataLayer 없는 Modifier를 레벨 visibility로 토글하는 방식은 **WP 환경에서 의도치 않게 무시될 수 있음**. 안정적인 방식은 DataLayer 기반 관리(+ Base에 넣지 않기) 또는 런타임 스폰.
+**요약**:
+- DataLayer 없는 Modifier를 WP 월드의 레벨 visibility로 토글하는 방식은 **WP 환경에서 의도치 않게 무시될 수 있음** (시나리오 A). 안정적 방식은 DataLayer 기반 관리(+ Base에 넣지 않기) 또는 런타임 스폰.
+- 반면 **Non-WP 네비메시 + WP 월드 조합**에서는 시나리오 C의 구조적 비효율이 나타나 프레임 비용 증가 가능성. 이 조합은 장거리 경로 탐색 요구가 있을 때 흔히 선택되므로, 해당 최적화 여지를 별도 이슈로 추적 (#15).
 
 ---
 
