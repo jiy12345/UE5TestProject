@@ -31,6 +31,14 @@ UE는 이 두 라이브러리를 `ARecastNavMesh`, `FRecastNavMeshGenerator` 등
 | [05-practical-guide.md](05-practical-guide.md) | 실전 활용 및 커스터마이징 가이드 |
 | [references.md](references.md) | 참고 자료 및 소스 파일 경로 |
 
+## 심층 분석
+
+| 폴더 | 내용 |
+|------|------|
+| [Pathfinding/](Pathfinding/) | 길찾기 로직 End-to-End 분석 (Detour A* → UE PathFollowing) |
+| [NavModifierBugAnalysis/](NavModifierBugAnalysis/) | NavModifier 버그 분석 |
+| [StreamingOptimization/](StreamingOptimization/) | 스트리밍 최적화 분석 |
+
 ## 선수 지식
 
 - UObject 시스템 (AActor, UActorComponent)
