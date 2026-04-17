@@ -191,141 +191,31 @@ ModVol->SetAreaClass(UNavArea_Water::StaticClass());
 
 ## 4. 이해도 확인 실습 — NavMesh 디버그 시각화
 
-분석한 내용을 직접 확인하는 C++ GameMode/Actor를 구현하여 `DynamicModifiersOnly` 동작을 이해합니다.
+> **구현 이슈**: [#19 — RecastNavMesh 디버그 시각화 컴포넌트 구현](https://github.com/jiy12345/UE5TestProject/issues/19)
+
+분석한 내용을 직접 확인하는 `UNavDebugVisualizerComponent`를 AGameMode나 임의 Actor에 부착하여 NavMesh와 경로 쿼리 결과를 시각화합니다.
 
 ### 실습 목표
 
-- NavMesh 타일 경계 시각화
-- 특정 위치의 NavArea ID / 이동 비용 출력
-- 경로 쿼리 결과 실시간 렌더링
+- 경로 쿼리 결과(`FindPathSync`)를 초록 선 + 노란 구체로 실시간 렌더링
+- 시작점의 NavMesh 투사(`ProjectPointToNavigation`) 결과를 시안/빨강 구체로 표시
+- 경로 실패 시 빨간 선 + "PATH NOT FOUND" 메시지
+- 화면에 PathPoints 수와 Length 출력
 
-### NavDebugVisualizerComponent
+**구현 코드, 상세 설계는 구현 이슈 [#19](https://github.com/jiy12345/UE5TestProject/issues/19)에서 다룹니다.**
 
-```cpp
-// NavDebugVisualizerComponent.h
-#pragma once
-#include "Components/ActorComponent.h"
-#include "NavMesh/RecastNavMesh.h"
-#include "NavDebugVisualizerComponent.generated.h"
-
-UCLASS(ClassGroup=(Navigation), meta=(BlueprintSpawnableComponent))
-class UNavDebugVisualizerComponent : public UActorComponent
-{
-    GENERATED_BODY()
-public:
-    virtual void TickComponent(float DeltaTime, ELevelTick TickType,
-                               FActorComponentTickFunction* ThisTickFunction) override;
-
-    /** 경로 쿼리 시작점 */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="NavDebug")
-    AActor* PathStart = nullptr;
-
-    /** 경로 쿼리 끝점 */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="NavDebug")
-    AActor* PathEnd = nullptr;
-
-    /** 활성화 여부 */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="NavDebug")
-    bool bEnabled = true;
-
-private:
-    void DrawNavPath();
-    void DrawNavMeshInfo(const FVector& Location);
-};
-```
-
-```cpp
-// NavDebugVisualizerComponent.cpp
-#include "NavDebugVisualizerComponent.h"
-#include "NavigationSystem.h"
-#include "DrawDebugHelpers.h"
-#include "NavMesh/RecastNavMesh.h"
-
-void UNavDebugVisualizerComponent::TickComponent(
-    float DeltaTime, ELevelTick TickType,
-    FActorComponentTickFunction* ThisTickFunction)
-{
-    Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
-    if (!bEnabled) return;
-
-    DrawNavPath();
-    if (PathStart)
-        DrawNavMeshInfo(PathStart->GetActorLocation());
-}
-
-void UNavDebugVisualizerComponent::DrawNavPath()
-{
-    if (!PathStart || !PathEnd) return;
-
-    UNavigationSystemV1* NavSys =
-        UNavigationSystemV1::GetNavigationSystem(GetWorld());
-    if (!NavSys) return;
-
-    FPathFindingQuery Query(
-        this,
-        *NavSys->GetDefaultNavDataInstance(),
-        PathStart->GetActorLocation(),
-        PathEnd->GetActorLocation()
-    );
-
-    FPathFindingResult Result = NavSys->FindPathSync(Query);
-    if (!Result.IsSuccessful() || !Result.Path.IsValid()) return;
-
-    const TArray<FNavPathPoint>& Points = Result.Path->GetPathPoints();
-    for (int32 i = 1; i < Points.Num(); ++i)
-    {
-        DrawDebugLine(GetWorld(),
-            Points[i - 1].Location,
-            Points[i].Location,
-            FColor::Green, false, -1.f, 0, 5.f);
-    }
-
-    // 경로 포인트 수 화면 출력
-    if (GEngine)
-    {
-        GEngine->AddOnScreenDebugMessage(
-            1, 0.f, FColor::Yellow,
-            FString::Printf(TEXT("PathPoints: %d  PathLen: %.0f cm"),
-                Points.Num(),
-                Result.Path->GetLength())
-        );
-    }
-}
-
-void UNavDebugVisualizerComponent::DrawNavMeshInfo(const FVector& Location)
-{
-    ARecastNavMesh* NavMesh = Cast<ARecastNavMesh>(
-        UNavigationSystemV1::GetNavigationSystem(GetWorld())
-            ->GetDefaultNavDataInstance());
-    if (!NavMesh) return;
-
-    // 위치 투사
-    FNavLocation NavLoc;
-    bool bOnNav = UNavigationSystemV1::GetNavigationSystem(GetWorld())
-        ->ProjectPointToNavigation(Location, NavLoc, FVector(50, 50, 100));
-
-    DrawDebugSphere(GetWorld(), NavLoc.Location, 20.f, 8,
-        bOnNav ? FColor::Cyan : FColor::Red, false, -1.f);
-
-    if (GEngine)
-    {
-        GEngine->AddOnScreenDebugMessage(
-            2, 0.f, FColor::Cyan,
-            FString::Printf(TEXT("OnNavMesh: %s  NodeRef: %llu"),
-                bOnNav ? TEXT("Yes") : TEXT("No"),
-                (uint64)NavLoc.NodeRef)
-        );
-    }
-}
-```
+이 섹션은 "무엇을 어떻게 눈으로 확인할 것인가"라는 개념적 목표와 검증 체크리스트에 집중합니다.
 
 ### 실습 검증 체크리스트
 
 - [ ] GameMode에서 컴포넌트 부착 또는 에디터에서 Actor에 추가
 - [ ] `PathStart`, `PathEnd` 설정 후 PIE 실행
 - [ ] 경로가 녹색 선으로 표시되는지 확인
+- [ ] 경유점이 노란 구체로 표시되는지 확인
+- [ ] 시작점 근처에 NavMesh 투사 성공 구체(시안/빨강) 표시
 - [ ] Nav Modifier Volume 배치 후 경로가 우회하는지 확인
 - [ ] `DynamicModifiersOnly` 모드에서 런타임 Nav Modifier 추가/제거 시 경로 변화 확인
+- [ ] 도달 불가능한 목표 설정 시 "PATH NOT FOUND" 메시지 표시
 
 ---
 
