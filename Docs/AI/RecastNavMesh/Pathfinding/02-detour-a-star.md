@@ -419,14 +419,84 @@ if (total > costLimit)
 
 ##### "CLOSED가 갱신되면 자손도 전파되어야 하지 않나?" — 핵심 질문
 
-**답: Detour는 자동으로 전파합니다.** CLOSED 노드가 더 나은 경로로 갱신되는 상황을 순서대로 따라가보면:
+**답: Detour는 자동으로 전파합니다.** 메인 A* 루프에서 CLOSED 노드가 재활성화되는 경로를 실제 코드로 따라가봅니다.
 
-1. Step 6 코드를 보면, CLOSED라도 `total < neighbourNode->total`이면 스킵하지 않고 **`flags &= ~DT_NODE_CLOSED`로 CLOSED 비트를 해제**합니다 (`DetourNavMeshQuery.cpp:1782`).
-2. 그 다음 **`flags |= DT_NODE_OPEN`으로 OPEN에 다시 추가**합니다 (`:1796`).
-3. 언젠가 이 노드가 다시 pop되면, 이번엔 **갱신된 낮은 `cost`로 이웃들을 재탐색**합니다.
-4. 이웃 노드들도 Step 5의 (1)/(2) 체크에서 새 경로가 더 낮으면 갱신 → 자손으로 전파.
+**(a) CLOSED 체크를 통과시키는 조건** — `DetourNavMeshQuery.cpp:1760-1764`
 
-즉 **"CLOSED는 영구 확정이 아니라 '현재까지 최선'"**이며, 새 경로가 개선이면 다시 OPEN으로 내려와서 자손까지 비용 전파가 일어납니다. 이 메커니즘은 **h가 admissible하면 이런 재활성화가 거의 발생하지 않고**, 비허용(non-admissible) 휴리스틱에서만 빈번합니다 (§4.2 참고).
+```cpp
+// 이 노드는 이미 visit/process되었고, 새 결과가 더 나쁘면 skip
+if ((neighbourNode->flags & DT_NODE_CLOSED) && total >= neighbourNode->total)
+{
+    UE_RECAST_ASTAR_LOG(Display, TEXT("      Skipping new cost higher..."));
+    continue;
+}
+```
+
+→ 새 `total < neighbourNode->total`일 때만 `continue`를 타지 않고 아래로 떨어짐. 이 한 줄이 **"CLOSED라도 더 나은 경로면 재활성화"의 직접 근거**.
+
+**(b) CLOSED 비트 해제 + cost/total 갱신** — `:1779-1785`
+
+```cpp
+// Add or update the node.
+neighbourNode->pidx  = m_nodePool->getNodeIdx(bestNode);       // 새 부모로 교체 (경로 복원 시 반영됨)
+neighbourNode->id    = neighbourRef;
+neighbourNode->flags = (neighbourNode->flags & ~DT_NODE_CLOSED); // ★ CLOSED 비트 해제
+neighbourNode->cost  = cost;                                    // g 낮아진 값
+neighbourNode->total = total;                                   // f 낮아진 값
+dtVcopy(neighbourNode->pos, neiPos);
+```
+
+**(c) OPEN 힙에 재삽입** — `:1787-1800`
+
+```cpp
+if (neighbourNode->flags & DT_NODE_OPEN)
+{
+    // OPEN이었으면 힙 위치만 조정
+    m_openList->modify(neighbourNode);
+}
+else
+{
+    // CLOSED였던 노드는 여기로 들어와서:
+    neighbourNode->flags |= DT_NODE_OPEN;    // ★ OPEN 비트 ON
+    m_openList->push(neighbourNode);         // ★ 힙에 재푸시 → 다시 pop 대상
+    m_queryNodes++;
+}
+```
+
+**자손까지의 재귀 전파**: (c)에서 push된 노드는 다시 pop되어 CLOSED로 마킹(`:1635-1636`)되고 이웃 M을 재탐색. 각 M에 대해 (a)의 체크가 **새 cost 기준**으로 평가되고, 개선이 있으면 동일한 (b)+(c) 경로를 타서 M도 재활성화. 더 이상 개선이 없을 때까지 반복 (종료 보장은 `:1627-1650`의 `loopCounter` 한계 및 비음수 비용으로 뒷받침).
+
+즉 **"CLOSED는 영구 확정이 아니라 '현재까지 최선'"**이며, 새 경로가 개선이면 다시 OPEN으로 내려와서 자손까지 비용 전파가 일어납니다.
+
+##### 이 재활성화가 실제로 발생하는가 — admissible vs consistent 구분
+
+"자손 전파가 필요한가"는 휴리스틱의 **단조성(consistency)**에 달려 있습니다. 단순히 admissible한 것만으로는 부족할 수 있습니다.
+
+| h의 성질 | 정의 | CLOSED 재활성화 |
+|---|---|---|
+| **Consistent (단조)** | 모든 간선 `(n, n')`에 대해 `h(n) ≤ cost(n, n') + h(n')` | **이론적으로 절대 발생 안 함** — 첫 CLOSED 시점이 곧 최적 |
+| **Admissible but inconsistent** | `h(n) ≤ 실제 잔여비용`이지만 단조롭지 않음 | 발생 가능, 여러 번 갱신·재활성화하며 최적으로 수렴 |
+| **Non-admissible** | 과대평가 허용 (Weighted A*) | 빈번, 순환 위험 → `shouldIgnoreClosedNodes` 옵션 필요 (§4.2) |
+
+**Detour의 기본 휴리스틱은 consistent입니다.** `H_SCALE = 0.999 × max(lowestAreaCost, 1.0)`이고 모든 `areaCost ≥ 1.0`인 표준 설정에서 역삼각 부등식으로 증명됩니다:
+
+```
+|h(n) - h(n')| ≤ ||n - n'|| × H_SCALE       (유클리드 거리 × 상수의 Lipschitz 상수)
+cost(n, n') = ||n - n'|| × areaCost          (H_SCALE ≤ lowestAreaCost ≤ areaCost)
+⇒ h(n) - h(n') ≤ cost(n, n')                (consistency 성립)
+```
+
+따라서 **기본 설정에서 첫 CLOSED 시점이 곧 최적**이며, 재활성화는 이론적으로 발생하지 않습니다.
+
+**그러면 왜 재활성화 코드 자체는 존재하는가** — 예외 상황 대비 **안전장치**입니다:
+
+| 예외 상황 | 일관성이 깨지는 이유 |
+|----------|-------------------|
+| **부동소수점 오차** | cost 비교가 이론값과 미세하게 엇갈려 같은 노드가 두 번 pop될 수 있음 |
+| **커스텀 필터의 동적 비용** | `getCost()`가 호출 컨텍스트에 따라 다른 값을 반환하면 단조성 위반 |
+| **lowestAreaCost < 1.0** | `H_SCALE = 0.999 × max(lowestAreaCost, 1.0) = 0.999`로 유지되지만 일부 간선의 `areaCost < 0.999`면 inconsistency |
+| **Weighted A* 모드** | 의도적으로 `heuristicScale > 1.0`로 설정 (§4.2) |
+
+즉 "재활성화 + 자손 전파" 메커니즘은 **admissible-but-inconsistent 상황에서만 실제로 작동**하며, 표준 설정에서는 이론적으로 호출되지 않는 safety net으로만 존재합니다. 이 때문에 "최적성이 보장되려면 재탐색이 필요한 것 아니냐"는 직관적 우려는 이론적으로는 유효하고, Detour는 그 경우에도 올바르게 처리합니다.
 
 ##### 그래서 CLOSED는 "다시 오지 말라"는 뜻인가?
 
