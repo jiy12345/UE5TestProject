@@ -220,6 +220,92 @@ graph LR
 - 런타임에 플레이어가 Cell(0,0) 근처에 있으면 `P1`만 로드됨 → `C1`만 메모리에 상주
 - 스트리밍된 프록시는 GUID 매칭으로 자기가 속한 마스터를 찾아 Info에 등록
 
+### 3.5 소유와 참조 관계 정리
+
+위 다이어그램의 화살표가 실제 UObject 소유/참조로 어떻게 구현되는지가 중요합니다. UE의 `UPROPERTY` 하드 참조(Owning), `TSoftObjectPtr`, `TWeakObjectPtr`, 레지스트리 색인 등이 뒤섞여 있어 혼란스러울 수 있어 명시합니다.
+
+#### 타입별 관계 표
+
+| 관계 | 방향 | 타입 | 의미 | 소유(GC)? |
+|------|------|------|------|----------|
+| **마스터 → 프록시** | `ALandscape` → `ALandscapeStreamingProxy` | **없음** (직접 참조 포인터가 없음) | 마스터는 프록시 목록을 직접 들지 않음. `ULandscapeInfo`가 대신 인덱싱. | ❌ 소유 아님 |
+| **프록시 → 마스터** | `ALandscapeStreamingProxy` → `ALandscape` | `TSoftObjectPtr<ALandscape> LandscapeActorRef` | 소프트 참조 (경로만 저장, 마스터 언로드돼도 프록시는 로드 가능) | ❌ 소유 아님 |
+| **프록시 → 컴포넌트** | `ALandscapeProxy` → `ULandscapeComponent` | `UPROPERTY() TArray<TObjectPtr<ULandscapeComponent>> LandscapeComponents` | **UPROPERTY 하드 참조** — 프록시가 파괴되면 컴포넌트도 함께 GC | ✅ **소유** |
+| **프록시 → 콜리전 컴포넌트** | `ALandscapeProxy` → `ULandscapeHeightfieldCollisionComponent` | `UPROPERTY() TArray<TObjectPtr<...>> CollisionComponents` | 하드 참조, 프록시 소속 | ✅ **소유** |
+| **컴포넌트 → 프록시** | `ULandscapeComponent` → `ALandscapeProxy` | `UCLASS(Within=LandscapeProxy)` + `GetOuter()` | Outer 관계 (부모로 이미 UE가 아는 소유 링크) | 반대 방향 |
+| **Info → 마스터** | `ULandscapeInfo` → `ALandscape` | `TWeakObjectPtr<ALandscape> LandscapeActor` | 약참조 — Info가 마스터를 "찾을" 수 있지만 keep-alive 안 함 | ❌ 소유 아님 |
+| **Info → 프록시들** | `ULandscapeInfo` → `ALandscapeStreamingProxy[]` | `TArray<TWeakObjectPtr<ALandscapeStreamingProxy>>` | 약참조 배열 — Info는 인덱스일 뿐 수명 주체 아님 | ❌ 소유 아님 |
+| **Info → 컴포넌트** | `ULandscapeInfo` → `ULandscapeComponent` | `TMap<FIntPoint, ULandscapeComponent*>` (raw, non-UPROPERTY) | 좌표 색인용 런타임 맵 | ❌ 소유 아님 |
+| **Subsystem → 프록시들** | `ULandscapeSubsystem` → `ALandscapeProxy[]` | `UPROPERTY(Transient) TArray<TObjectPtr<ALandscapeProxy>>` | Transient 하드 참조 — 등록된 프록시의 수명 연장 보조 (액터 자체는 Level이 소유) | 보조 keep-alive |
+| **컴포넌트 → 텍스처** | `ULandscapeComponent` → `UTexture2D` | `UPROPERTY() TObjectPtr<UTexture2D> HeightmapTexture` | 하드 참조 (복수 컴포넌트가 한 텍스처 공유 가능) | ✅ 참조 |
+
+#### 실제 "수명(lifetime)"을 결정하는 소유자
+
+누가 파괴되면 누가 같이 파괴되는지:
+
+```
+Level (UE Level)
+  │ (Level이 AActor들을 owning 컨테이너)
+  ├─ ALandscape (마스터)
+  │    ├─ LandscapeEditLayers[]           ← 마스터가 UPROPERTY로 소유
+  │    ├─ LandscapeComponents[]            ← 소속 컴포넌트 (있으면)
+  │    └─ CollisionComponents[]
+  │
+  └─ ALandscapeStreamingProxy들 (WP 맵)
+       ├─ LandscapeComponents[]            ← 프록시가 UPROPERTY로 소유
+       │    └─ HeightmapTexture, WeightmapTextures[], MaterialInstances[]
+       │         (각자 UPROPERTY 하드 참조)
+       └─ CollisionComponents[]
+
+ULandscapeInfo (Transient, 월드 서브시스템 옆에 붙음)
+  ↓ 약참조만
+  ├─ LandscapeActor (Weak)
+  ├─ StreamingProxies[] (Weak)
+  └─ XYtoComponentMap (raw)
+
+ULandscapeSubsystem (World Subsystem)
+  ├─ Proxies[] (Transient, keep-alive 보조)
+  └─ 레지스트리 / 관리 유틸
+```
+
+#### 다이어그램의 각 화살표 해석
+
+위 §3.4 다이어그램으로 돌아오면:
+
+| 다이어그램 화살표 | 실제 코드상 구현 |
+|---|---|
+| `A -.공유 속성 원본.-> P1~P4` | **직접 참조 아님**. 프록시가 로드될 때 `FixupOverriddenSharedProperties()`가 마스터 값을 프록시 로컬 사본에 **복사**. `OverriddenSharedProperties`로 예외 관리. |
+| `P1 --> C1`, `P2 --> C2`, ... | **UPROPERTY 하드 참조**: `TArray<TObjectPtr<ULandscapeComponent>> LandscapeComponents`. 프록시가 컴포넌트를 진짜로 "소유". |
+
+요약하면:
+- **"마스터가 프록시들을 소유한다"는 오해**: 실제로는 그렇지 않습니다. 둘 다 Level이 소유하는 형제 액터.
+- **"마스터가 모든 컴포넌트를 가진다"도 오해**: 비파티션 맵에서만 참. WP 맵에서는 각 스트리밍 프록시가 자기 영역 컴포넌트를 각자 소유.
+- **ULandscapeInfo는 수명 주체가 아님**: 단지 좌표·GUID 기반 **조회 인덱스**. 프록시 언로드 시 자동으로 약참조가 무효화됨.
+
+### 3.6 WP 맵에서 프록시 "관리"의 주체는 누구인가
+
+"마스터가 프록시들을 관리한다"고 생각하기 쉽지만, WP 맵에서 프록시 **생명 주기(Spawn / Despawn)** 의 실제 주체는 **World Partition 서브시스템**입니다:
+
+| 관심사 | 주체 | 메커니즘 |
+|-------|------|--------|
+| 프록시 언제 로드? | **World Partition** | 그리드 셀이 플레이어 시야/로딩 반경에 들어오면 해당 셀의 패키지 로드 → 프록시 액터 스폰 |
+| 프록시 언제 언로드? | **World Partition** | 셀이 멀어지면 패키지 언로드 → 프록시 Destroy |
+| 어느 셀에 어느 프록시? | **WP ActorDesc** (프록시의 `GetActorDescProperties`가 내보낸 메타데이터) | 에디터 저장 시 파티션 메타데이터로 기록 |
+| 그리드 크기 정책 | `ALandscape`의 `GetGridSize` | 마스터가 "몇 컴포넌트 단위로 셀을 쪼갤지" 설정 |
+| 스폰된 프록시의 검증 | 프록시 자신 | `IsValidLandscapeActor()`로 GUID 매칭, 실패 시 렌더·콜리전 비활성 |
+| 스폰된 프록시의 레지스트리 등록 | `ULandscapeInfo` + `ULandscapeSubsystem` | 프록시의 `PostRegisterAllComponents` 내부 |
+| 공유 속성 주입 | 프록시 자신 + 마스터 참조 | `FixupOverriddenSharedProperties()`로 마스터 값 복사 |
+
+즉 분업이 명확합니다:
+- **WP**: "어느 셀을 언제 로드/언로드할지" 결정 (공간적 가시성 판단)
+- **마스터(`ALandscape`)**: "Landscape 전체 기본값"을 제공 (공유 속성, 그리드 크기 정책, Edit Layer 상태)
+- **스트리밍 프록시**: WP가 스폰해주면 자기 초기화 (마스터 참조 검증, Info 등록, 공유 속성 흡수)
+- **`ULandscapeInfo` / `ULandscapeSubsystem`**: 등록된 액터들을 좌표·GUID로 조회 가능하게 인덱싱
+
+WP가 아닌 전통 맵이라면 WP 대신 **Level 자체**가 프록시(보통 마스터 하나) 수명을 관리하고, 나머지 관계는 동일합니다.
+
+자세한 로드/언로드 시퀀스는 이후 §5와 [07-streaming-wp.md](07-streaming-wp.md) 참고.
+
 ## 4. ULandscapeInfo — 월드 레지스트리
 
 마스터와 스트리밍 프록시, 그리고 각 프록시의 컴포넌트들을 **좌표 기반으로 찾아주는 인덱스**가 필요합니다. 이를 `ULandscapeInfo`가 담당합니다.
