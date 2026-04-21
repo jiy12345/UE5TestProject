@@ -5,6 +5,74 @@
 
 이 문서는 Landscape 시스템의 주요 클래스·구조체를 **빠르게 찾아보기 위한 레퍼런스 카드**입니다. 동작 원리는 관련 문서 링크를 따라가세요.
 
+## 0. 컴포넌트 부착 규칙 — "이 컴포넌트들은 어느 액터에 붙나?"
+
+이 문서에는 수많은 `U*Component` 클래스(`ULandscapeComponent`, `ULandscapeHeightfieldCollisionComponent`, `ULandscapeNaniteComponent` 등)가 등장합니다. 공통 부착 규칙을 먼저 짚어둡니다.
+
+**핵심 규칙**: Landscape 관련 모든 컴포넌트 클래스는 UHT 메타데이터 `UCLASS(Within=LandscapeProxy)`로 **반드시 `ALandscapeProxy`를 `Outer`로 가져야 함**이 강제됩니다. 즉:
+
+```cpp
+// 예시
+UCLASS(..., MinimalAPI, Within=LandscapeProxy)
+class ULandscapeComponent : public UPrimitiveComponent { ... };
+
+UCLASS(MinimalAPI, Within=LandscapeProxy)
+class ULandscapeHeightfieldCollisionComponent : public UPrimitiveComponent { ... };
+
+UCLASS(..., MinimalAPI, Within=LandscapeProxy)
+class ULandscapeNaniteComponent : public UStaticMeshComponent { ... };
+```
+
+그런데 `ALandscape`가 `ALandscapeProxy`를 상속하니, 실질적으로 **`ALandscape`도 Outer 대상**이 됩니다. 이게 비파티션 맵 / WP 맵의 분기를 만듭니다.
+
+### 0.1 비파티션 맵 (전통 맵)
+
+```
+ALandscape (마스터 하나가 모든 것을 보유)
+  ├── ULandscapeComponent × N            (렌더 타일)
+  ├── ULandscapeHeightfieldCollisionComponent × N  (콜리전 타일)
+  ├── ULandscapeNaniteComponent          (선택적)
+  ├── ULandscapeSplinesComponent         (스플라인)
+  └── (기타 보조 컴포넌트들)
+```
+
+마스터 액터가 **자기가 곧 지형 전체**라서 모든 컴포넌트를 직접 소유합니다.
+
+### 0.2 WP 맵 (월드 파티션)
+
+```
+ALandscape (마스터, 퍼시스턴트 레벨)
+  ├── (일반적으로 실제 지형 컴포넌트 없음)
+  └── 편집 레이어 스택 + 공유 속성만 보유
+  
+ALandscapeStreamingProxy [Cell 0,0]
+  ├── ULandscapeComponent × N_00          (이 셀의 렌더 타일)
+  ├── ULandscapeHeightfieldCollisionComponent × N_00  (이 셀의 콜리전)
+  └── ULandscapeNaniteComponent           (이 셀용, 선택)
+
+ALandscapeStreamingProxy [Cell 0,1]
+  ├── ULandscapeComponent × N_01
+  ├── ULandscapeHeightfieldCollisionComponent × N_01
+  └── ...
+  
+(각 셀마다 반복)
+```
+
+마스터는 "편집 권한 + 공유 속성 + 그리드 정책"만 보유하고, **실제 지형 컴포넌트는 각 스트리밍 프록시가 자기 영역분을 각자 소유**합니다. 사용자가 보는 전체 지형은 모든 프록시의 컴포넌트들의 합집합.
+
+### 0.3 한눈에 요약
+
+| 컴포넌트 | 비파티션 맵에서 Outer | WP 맵에서 Outer |
+|---------|-------------------|---------------|
+| `ULandscapeComponent` | `ALandscape` | 담당 셀의 `ALandscapeStreamingProxy` |
+| `ULandscapeHeightfieldCollisionComponent` | `ALandscape` | 담당 셀의 `ALandscapeStreamingProxy` |
+| `ULandscapeNaniteComponent` | `ALandscape` | 담당 셀의 `ALandscapeStreamingProxy` |
+| `ULandscapeSplinesComponent` | `ALandscape` | 프로젝트 설정에 따라 마스터 또는 SplineActor |
+
+참고로 `ALandscape` 자신이 `ALandscapeProxy`를 상속하므로 `Within=LandscapeProxy` 제약을 만족합니다. "누가 어디 붙느냐"의 실제 판정은 편집 시 컴포넌트를 어느 Proxy에 생성했는지(그리드 셀 기반 자동 배치 or 수동 `MoveComponentsToProxy`)에 의해 결정됩니다.
+
+자세한 WP 그리드 분배 규칙은 [07-streaming-wp.md §2](07-streaming-wp.md) 참고.
+
 ## 1. 액터 클래스 (자세한 것은 [02-architecture.md](02-architecture.md))
 
 ### ALandscapeProxy — 공통 지형 타일 액터
