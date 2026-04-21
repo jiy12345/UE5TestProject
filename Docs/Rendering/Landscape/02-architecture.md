@@ -18,6 +18,44 @@ Landscape를 처음 들여다보면 `ALandscape`, `ALandscapeProxy`, `ALandscape
 - **비파티션 맵** (전통적인 월드): `ALandscape` **하나**가 모든 컴포넌트를 직접 보유. 스트리밍 프록시 없음.
 - **World Partition 맵**: `ALandscape` **하나**가 편집 권한만 보유하고 **실제 컴포넌트는 여러 `ALandscapeStreamingProxy`**에 분산.
 
+### 1.1 먼저 짚고 갈 용어
+
+위 표에 등장하는 "**컴포넌트**"와 "**WP 맵에서의 마스터/프록시 관계**"를 명확히 해두면 이후 내용이 훨씬 잘 읽힙니다.
+
+#### "컴포넌트" = `ULandscapeComponent`
+
+이 문서에서 말하는 "컴포넌트"는 단일 `ULandscapeComponent` 인스턴스를 뜻하며, **지형 타일 하나**의 데이터를 담는 Unreal 액터 컴포넌트입니다. 구체적으로:
+
+- 보통 63×63 또는 127×127 quads 크기의 정사각 영역
+- **`HeightmapTexture` 한 장** + **`WeightmapTextures` 여러 장** 보유
+- 렌더링용 `FLandscapeComponentSceneProxy`를 생성
+- 대응되는 `ULandscapeHeightfieldCollisionComponent`(물리)와 쌍으로 존재
+
+자세한 내부 구조는 [03-core-classes.md §4](03-core-classes.md) / [04-heightmap-weightmap.md](04-heightmap-weightmap.md) 참고.
+
+#### WP 맵에서 `ALandscape`와 `ALandscapeStreamingProxy`는 "상하"가 아니라 "형제"
+
+직관적으로 "`ALandscape`가 상위, `ALandscapeStreamingProxy`가 하위"라고 생각하기 쉽지만, **언리얼 월드 액터 트리에는 둘 다 별도의 `AActor`로 나란히 존재**합니다. 부모-자식 관계가 아닙니다:
+
+```
+World Outliner:
+  PersistentLevel
+  ├── ALandscape (마스터, GUID=G1)         ← 항상 로드됨, 편집 권한·공유 속성 보유
+  └── (WP 그리드 셀들이 로드되면 추가로)
+      ├── ALandscapeStreamingProxy [Cell 0,0]  (Soft ref → G1)
+      ├── ALandscapeStreamingProxy [Cell 0,1]  (Soft ref → G1)
+      ├── ALandscapeStreamingProxy [Cell 1,0]  (Soft ref → G1)
+      └── ...
+```
+
+관계의 성격:
+- **참조**: 각 StreamingProxy가 `TSoftObjectPtr<ALandscape>`로 마스터를 가리킴 (Soft 참조라 마스터가 언로드돼도 프록시 로드 자체는 가능)
+- **GUID 매칭**: 같은 논리적 Landscape에 속한다는 증빙은 `LandscapeGuid`
+- **권한 분담**: 마스터 = "편집 및 공유 속성의 권위자", 프록시 = "실제 지형 타일 데이터"
+- **논리적 집합의 표현**: 둘 다 `ULandscapeInfo` 레지스트리에 등록되어 함께 관리됨 (§4)
+
+즉 WP 맵에서 "하나의 Landscape"는 **마스터 1 + 스트리밍 프록시 N**이 **GUID로 묶인 형제 액터 집합**으로 존재합니다.
+
 ## 2. 클래스 계층
 
 ```
@@ -52,20 +90,76 @@ AActor
 
 ### 3.2 ALandscape — 마스터 액터
 
-`ALandscapeProxy`에 **편집 권한과 공유 속성 권한**을 추가합니다:
+`ALandscapeProxy`에 **편집 권한과 공유 속성 권한**을 추가합니다. 두 권한이 각각 구체적으로 무엇을 뜻하는지:
 
-- **Edit Layers 소유** — `TArray<FLandscapeLayer> LandscapeEditLayers` (비공개)
-- **공유 속성 권한** — 스트리밍 프록시가 참조할 기본값 (LOD 설정, Nanite 설정, 그라스 업데이트 등)
+#### "편집 권한"이 가리키는 것
+
+여기서 "편집"은 **Edit Layers 기반의 스컬프트/페인트 작업**입니다. 상세는 [05-edit-layers.md](05-edit-layers.md)에서 다루지만 요약하면:
+
+- **스컬프트(Sculpt)** — 브러시로 Heightmap 높이를 올리고 내림
+- **페인트(Paint)** — 브러시로 Weightmap 레이어 가중치를 칠함
+- **편집 레이어 관리** — 여러 편집 레이어를 스택처럼 쌓고 순서 바꾸고 켜고 끄기
+- **스플라인 편집** — Landscape 위에 경로를 긋고 주변 지형을 변형
+
+이 모든 편집의 **"지금 어떤 레이어에 쓰고 있는가"**, **"어떤 브러시가 어느 레이어에 속하는가"** 같은 상태는 **마스터 `ALandscape` 하나만**이 보유합니다. 스트리밍 프록시는 편집 대상 영역에 해당하는 컴포넌트를 제공할 뿐, 편집 세션 상태를 따로 가지지 않습니다.
+
+관련 구성:
+- `TArray<FLandscapeLayer> LandscapeEditLayers` (Landscape.h:720, private) — 편집 레이어 스택
+- `FGuid EditingLayer` — 현재 편집 중인 레이어
+- `CreateLayer`, `DeleteLayer`, `ReorderLayer`, `SetEditingLayer`, `ForceLayersFullUpdate` 등 API
+
+#### "공유 속성"이 가리키는 것
+
+WP 맵에서 모든 스트리밍 프록시가 공유해야 할 **"Landscape 전체 설정"**입니다. 대표 예시:
+
+| 공유 속성 예시 | 왜 공유되어야 하나 |
+|---|---|
+| `LandscapeMaterial` | 인접 프록시 간 재질 차이 → 경계에서 시각적 불연속 |
+| LOD 파라미터 (`LODDistributionSetting`, `LOD0DistributionSetting`) | 같은 거리에서 프록시마다 LOD가 다르면 티 남 |
+| Nanite 설정 (`bEnableNanite`, Nanite Position Precision, Skirt) | 부분적으로만 Nanite면 렌더 일관성 깨짐 |
+| `CastShadow`, `bCastStaticShadow` | 그림자 경계 불연속 방지 |
+| `CollisionMipLevel`, `SimpleCollisionMipLevel` | 콜리전 정밀도 일관성 |
+
+이들은 마스터의 값이 "Landscape 전체 기본값"으로 쓰이고, 스트리밍 프록시는 자동으로 이 값을 따릅니다.
+
+#### 마스터와 프록시 속성이 다르면 어떻게 동작하나
+
+흔한 오해: "프록시가 ALandscapeProxy를 상속하니 같은 속성을 독립적으로 갖는데, 값이 서로 다르면 충돌하지 않나?"
+
+실제 메커니즘은 **"기본 = 마스터 값 사용, 예외 = 명시적 오버라이드"**입니다:
+
+1. 프록시 로드 시 `PostRegisterAllComponents` 내에서 `FixupOverriddenSharedProperties()`가 호출됨
+2. 이 함수는 **마스터의 공유 속성 값을 프록시의 로컬 사본에 복사**
+3. 단 프록시의 `OverriddenSharedProperties: TSet<FName>`에 등록된 속성 이름은 **복사에서 제외** → 프록시가 들고 있는 로컬 값이 우선
+4. 사용자가 프록시 디테일 창에서 속성을 **명시적으로 변경**하면 그 속성 이름이 자동으로 `OverriddenSharedProperties`에 추가됨
+
+즉:
+- **기본 상태**: 프록시의 모든 공유 속성 ← 마스터 값 (사용자 눈에는 "상속됨"으로 표시)
+- **수동 오버라이드**: 특정 프록시만 "이 재질 다르게"라고 지정 → 해당 속성만 프록시 로컬 값 사용, 다른 속성은 계속 마스터 값 추종
+- **마스터 값 변경**: 이전에 오버라이드되지 않은 모든 프록시에 자동 전파
+
+이 메커니즘의 장점:
+- 기본은 깔끔한 일관성 (값이 한 곳, 여러 곳에 자동 반영)
+- 필요할 때만 국소 예외 (특정 프록시만 디버그 재질 등)
+- "어떤 프록시가 표준에서 벗어났는지"가 `OverriddenSharedProperties` 집합으로 명시적 추적됨
+
+자세한 오버라이드 API와 델리게이트는 [07-streaming-wp.md §3](07-streaming-wp.md) 참고.
+
+#### 나머지 핵심 책임
+
 - **Edit Layer 업데이트 엔트리** — `TickLayers`, `RegenerateLayersHeightmaps`, `PerformLayersHeightmapsBatchedMerge` 등 편집 레이어 → 최종 텍스처 머지 파이프라인이 여기서 시작
-- **Spatial loading 제한** — `CanChangeIsSpatiallyLoadedFlag() -> false` (마스터는 항상 로드된 상태로 월드에 존재)
-- **Landscape 편집 API** — `CreateLayer`, `DeleteLayer`, `ReorderLayer`, `SetEditingLayer` 등 에디터 작업의 진입점
+- **Spatial loading 제한** — `CanChangeIsSpatiallyLoadedFlag() -> false` (마스터는 항상 로드된 상태로 월드에 존재해야 편집 권위자 역할 가능)
+- **런타임 블루프린트 API** — `RenderHeightmap`, `RenderWeightmap` 등 블루프린트에서 최종 합성 텍스처를 외부 RT로 덤프하는 엔트리
 
 > **소스 확인 위치**
 > - `Engine/Source/Runtime/Landscape/Classes/Landscape.h:276` — `ALandscape` 선언
 > - `Landscape.h:289-291` — `GetLandscapeActor()` 오버라이드 (자신을 반환)
 > - `Landscape.h:324` — `CanChangeIsSpatiallyLoadedFlag() -> false`
 > - `Landscape.h:412-415` — `CreateLayer`, `CreateDefaultLayer`
+> - `Landscape.h:508` — `SetEditingLayer(FGuid)` — 현재 편집 레이어 설정
 > - `Landscape.h:720` — `LandscapeEditLayers` 비공개 저장소
+> - `Engine/Source/Runtime/Landscape/Classes/LandscapeStreamingProxy.h:35-36` — `OverriddenSharedProperties`
+> - `LandscapeStreamingProxy.h:67-72` — 오버라이드 판정/설정/fixup API
 
 ### 3.3 ALandscapeStreamingProxy — 스트리밍 타일
 

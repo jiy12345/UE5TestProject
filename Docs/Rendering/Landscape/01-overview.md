@@ -18,6 +18,80 @@
 
 핵심 통찰은 "**지형은 본질적으로 텍스처 기반 높이맵**이라는 데이터 특성"을 활용하는 것입니다. 정점 데이터가 아니라 Heightmap 텍스처에서 GPU가 직접 위치를 읽어 그리는 구조라, 메모리 효율·LOD 생성·에디터 편집이 모두 단순해집니다.
 
+### 1.1 표에 나온 용어 풀이
+
+위 비교표에 압축되어 있는 용어 몇 가지를 미리 풀어둡니다.
+
+#### Tessellation seam (LOD 이음새)
+
+두 개의 지형 타일이 인접해 있고 **서로 다른 해상도(LOD)**로 그려질 때, 공유 경계의 정점 수가 맞지 않으면 **삼각형이 맞물리지 않는 틈**이 생깁니다. 시각적으로는 "V자 모양의 균열"이나 겹침으로 나타납니다.
+
+```
+ LOD 0 타일 (세밀)                  LOD 2 타일 (성긴)
+  ─┬─┬─┬─┬─┬─┬─┬─┬─            ─────┬─────────┬──
+   │ │ │ │ │ │ │ │                  │         │
+   │ │ │ │ │ │ │ │                  │         │
+   │ │ │ │ │ │ │ │                  │         │
+   │ │ │ │ │ │ │ │                  │         │
+   경계: 정점 8개                      경계: 정점 2개
+                   ↓ 맞물리지 않음 ↑
+                       (V자 틈 발생)
+```
+
+StaticMesh에서는 이 문제를 해결하려면 **Stitching mesh**(경계 전용 패치 메시)를 별도로 만들거나, 모든 LOD 경계에 skirt을 내려 틈을 가려야 해서 복잡합니다.
+
+#### Continuous LOD + Morphing
+
+Landscape는 LOD를 **정수 단계가 아니라 실수값**으로 가집니다. "LOD 2.3"처럼 중간값이 있을 수 있고, 셰이더가 **LOD 2 정점 위치와 LOD 3 정점 위치를 선형 보간**해 그 중간 지점에 정점을 놓습니다 (이것이 **Morphing**).
+
+```
+  카메라 거리 증가 →
+   |LOD 0| ... |LOD 1| ... |LOD 2| ... |LOD 3|
+      ↑          ↑           ↑
+    boundary  boundary   boundary
+    (매끄럽게 보간되는 구간 = "LOD blend range")
+```
+
+거리가 LOD 경계를 지날 때 **정점 수가 갑자기 변하지 않고** 정점이 서서히 녹아들어 옆 정점과 합쳐집니다. 사용자 눈에는 "LOD가 바뀌었다"는 pop이 보이지 않습니다. 상세 구현은 [06-rendering-pipeline.md §2.4](06-rendering-pipeline.md) 참고.
+
+이 두 기법이 결합되어 Landscape는 **정적 LOD 슬롯 5~8단계로 끊어지는 StaticMesh**와 달리 부드러운 거리 기반 세밀도 조절이 가능합니다.
+
+### 1.2 StaticMesh로 같은 지형을 만들면 구체적으로 얼마나 힘든가
+
+표의 각 행을 실제 시나리오로 풀어보면:
+
+#### km² 규모의 넓은 지형
+
+| 측정 | StaticMesh 1개 | Landscape |
+|------|--------------|-----------|
+| 1km × 1km, 1m 간격 정점 | 1,000,000 정점 × 32바이트 = **32MB 정점 데이터** (+ 인덱스, 노멀, UV) | 컴포넌트 15×15 = 225개, 각 256×256 Heightmap (RG16 기준 128KB) = **약 28MB** (로드 여부와 무관, 전체 타일 합) |
+| 10km × 10km | **3.2GB** 단일 메시 (실용 불가) | 225 × 100 = 22,500 컴포넌트, 필요한 영역만 스트리밍 → **상시 메모리 수십 MB** |
+
+StaticMesh로 km² 지형을 하려면 **메시를 수동으로 여러 조각으로 쪼개고 각자 스트리밍 볼륨을 달아야** 합니다. 그런데 쪼갠 메시 경계에서 §1.1의 tessellation seam이 또 문제가 됩니다.
+
+#### 실시간 편집
+
+**StaticMesh 워크플로우**: DCC(Blender/Maya)에서 편집 → export → FBX 임포트 → 머티리얼 재할당 → 콜리전 재빌드 → 라이팅 재빌드. **한 번의 수정에 수 분~수십 분**. 지형 모양이 머리 속에 확정된 경우에만 실용적.
+
+**Landscape 워크플로우**: 에디터 내 브러시 → 실시간 미리보기 → 만족할 때까지 계속. **즉시 반영**. 탐색적 작업에 적합.
+
+#### 레이어 기반 페인팅 (예: 풀/바위/흙 혼합)
+
+**StaticMesh**: 머티리얼 하나가 3개 텍스처를 블렌딩하려면
+- 각 픽셀에서 레이어 비율을 결정할 **마스크 텍스처**(보통 UV 공간에 수동으로 그려야 함)가 필요
+- 머티리얼 그래프가 복잡해지고 **각 레이어의 Normal/Roughness/Color/AO까지 모두 블렌딩** 로직을 수동으로
+- 타일링 한계: UV가 한 번만 깔리니 같은 패턴이 반복 → 멀리서 보면 격자무늬
+
+**Landscape**: Weightmap 텍스처가 자동으로 레이어 비율 저장, 머티리얼은 `Layer Blend` 노드 하나로 해결, 레이어별 UV 타일링 스케일을 자유롭게 (가까이: 세밀, 멀리: 큰 스케일) 설정.
+
+#### 물리/NavMesh 자동 연동
+
+**StaticMesh**: 메시를 수정할 때마다 **Simple Collision 수동 편집** + **Complex Collision 재쿠킹** + **NavMesh 재빌드**. 수정 → 플레이 테스트 루프가 한 번에 수 분.
+
+**Landscape**: 높이맵이 바뀌면 다음 틱에 `RecreateCollision`이 자동 호출, NavMesh도 변경 영역만 증분 재빌드. 브러시 드래그하면서 AI가 새 경로로 움직이는 것을 실시간 확인.
+
+요컨대 **개별 기능은 StaticMesh로도 억지로 흉내낼 수 있지만, 모두 합쳐서 "한 사람의 지형 아티스트"가 감당 가능한 작업량이 되느냐**가 관건이고, Landscape는 이 균형을 잡기 위해 Heightmap 중심 데이터 구조를 선택했습니다.
+
 ## 2. StaticMesh vs Landscape — 같은 지형을 표현할 때 차이
 
 ```
@@ -38,10 +112,58 @@ StaticMesh 접근:                        Landscape 접근:
 
 실제 크기를 가늠해보면 **Landscape 컴포넌트 1개 = 보통 63×63 또는 127×127 quads**입니다. 이 컴포넌트 하나가 **하나의 `FPrimitiveSceneProxy`**, **하나의 Heightmap 텍스처(256×256 or 512×512)**, **여러 개의 Weightmap 텍스처**를 가집니다.
 
+### 2.1 Landscape는 정점이 없는가? — 오해 없이 이해하기
+
+위 ASCII 비교를 보면 Landscape 쪽에 "공유 버텍스 버퍼 재사용"만 적혀 있어서 "**정점이 없다**"로 읽힐 수 있습니다. 정확한 서술은 다음과 같습니다.
+
+**Landscape도 정점은 있습니다**. 다만 StaticMesh와는 다르게 쓰입니다:
+
+| 요소 | StaticMesh | Landscape |
+|------|----------|-----------|
+| 정점 XY 위치 | 메시 파일마다 고유 (아티스트 지정) | **모든 컴포넌트가 동일한 정규 격자** (예: 127×127 규칙적 격자) |
+| 정점 Z 위치 | 메시 파일에 상수로 박힘 | **Heightmap 텍스처에서 VS가 런타임 샘플링** |
+| 정점 버퍼 저장소 | 메시마다 별도 | **같은 크기 구성 컴포넌트들 간 공유** (`FLandscapeSharedBuffers`) |
+| 정점 수 | 모델마다 다름 | 컴포넌트당 고정 (예: 128² = 16384개) |
+
+즉 Landscape의 정점 버퍼는 **"정점이 어떤 규칙적 2D 그리드 위치에 있다"만 담은 토폴로지 스켈레톤**이고, **실제 3D 형상은 Heightmap 텍스처가 정한다**는 구조입니다. 정점 셰이더에서:
+
+```hlsl
+// 단순화된 개념 코드
+float2 GridPos = VertexInput.GridXY;              // 정점 버퍼의 규칙적 격자 위치
+float Height = HeightmapTexture.SampleLevel(Sampler, GridPos * UVScale + UVBias, LOD).r;
+float3 WorldPos = float3(GridPos, Height);        // Z만 텍스처에서 결정
+```
+
+이 모델 덕분에:
+- 정점 버퍼 한 벌만 만들어두면 모든 컴포넌트에서 재사용 가능
+- 지형 높이 수정 = 텍스처 수정 (정점 버퍼는 그대로)
+- LOD는 **Heightmap의 밉맵을 샘플링**하는 방식으로 자연스럽게 구현
+
+### 2.2 Heightmap 텍스처와 재질 텍스처만 있으면 Landscape인가?
+
+**기하(geometry) 관점**에서는 거의 그렇습니다:
+
+- **Heightmap 텍스처 하나** + **정규 격자 정점 수(Component/Subsection 크기)** → 최종 3D 메시 결정
+- **Weightmap 텍스처들** → 각 지점에 어떤 페인트 레이어가 얼마만큼 섞여 있는지
+- **Normalmap** → 실제로는 같은 Heightmap 텍스처의 BA 채널에 X,Y가 들어 있음 ([04-heightmap-weightmap.md §3.3](04-heightmap-weightmap.md) 참고)
+
+다만 **최종 화면 결과**를 얻으려면 그 위에 재질(Material)이 필요하고, 재질이 다음을 결합합니다:
+- 페인트 레이어별 Albedo/Normal/Roughness/AO 텍스처들 (레이어당 4~5장, 레이어 수 × 4~5장)
+- Weightmap으로 레이어별 블렌딩
+- (선택) Runtime Virtual Texture 기여, 데칼, 그래스 분포 마스크 등
+
+그래서:
+- **"표현(geometry)"만 놓고 보면**: Heightmap + 컴포넌트 크기 설정 + (구멍을 위한) Visibility 마스크 이면 충분
+- **"렌더링까지"를 놓고 보면**: 위 + Weightmap들 + 레이어별 재질 텍스처들 + 재질 그래프
+
+StaticMesh와의 결정적 차이는 **기하 정보가 `.uasset` 메시 파일이 아니라 텍스처에 있다**는 점입니다. 같은 Heightmap 텍스처에 다른 재질을 입히면 같은 지형 모양이 다른 외관으로 렌더됩니다.
+
 > **소스 확인 위치**
 > - `Engine/Source/Runtime/Landscape/Classes/LandscapeComponent.h:427-435` — `ComponentSizeQuads`, `SubsectionSizeQuads`, `NumSubsections` 선언
 > - `Engine/Source/Runtime/Landscape/Classes/LandscapeComponent.h:552` — `HeightmapTexture`
 > - `Engine/Source/Runtime/Landscape/Classes/LandscapeComponent.h:556` — `WeightmapTextures[]`
+> - `Engine/Source/Runtime/Landscape/Public/LandscapeRender.h:116-140` — `FLandscapeUniformShaderParameters`에서 Heightmap을 VS로 바인딩하는 지점
+> - `Engine/Source/Runtime/Landscape/Public/LandscapeRender.h:358-412` — `FLandscapeSharedBuffers` (공유 정점 버퍼)
 
 ## 3. 전체 데이터 플로우
 
