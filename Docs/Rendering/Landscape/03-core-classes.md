@@ -73,11 +73,32 @@
   - `Tick(DeltaTime)` — 그래스/스트리밍 갱신 구동
   - `RegisterActor(Proxy)` / `UnregisterActor(Proxy)`
   - 전역 유틸: `UE::Landscape::HasModifiedLandscapes()`, `BuildGrassMaps(BuildFlags)`, `BuildNanite(...)`, `BuildAll(...)`
+- **⚠️ 이 서브시스템이 하지 않는 것 — 프록시 스트리밍**:
+  `ULandscapeSubsystem`은 `ALandscapeStreamingProxy`의 **스폰·Despawn을 담당하지 않습니다**. 이름에 "StreamingManager"가 들어간 멤버는 **텍스처 스트리밍(Heightmap/Weightmap 밉 우선순위)** 을 뜻하며, 액터 스트리밍이 아닙니다.
+  
+  - **프록시 로드/언로드의 주체**: **World Partition** (그리드 셀 로딩 시스템). WP가 셀 패키지를 로드하면 프록시가 스폰되고, 스폰 후 `RegisterActor`가 이 서브시스템에 호출되어 **레지스트리에 이름만 등록**됩니다.
+  - **서브시스템이 하는 일**: 이미 스폰된 프록시들을 "알고 있는 상태"로 유지 + 프록시 그룹핑(LOD 조정) + 그래스 빌드 오케스트레이션 + 텍스처 스트리밍 우선순위 힌트 제공 + 편집 관련 유틸(BuildAll 등).
+  - 자세한 분업은 [02-architecture.md §3.6](02-architecture.md) 및 [07-streaming-wp.md §4](07-streaming-wp.md) 참고.
 
 ## 4. ULandscapeComponent — 타일 하나의 데이터 컨테이너
 - **파일**: `Engine/Source/Runtime/Landscape/Classes/LandscapeComponent.h`
 - **부모**: `UPrimitiveComponent`
 - **역할**: 섹션 하나의 Heightmap/Weightmap/재질 인스턴스/렌더 프록시를 보유하는 Landscape의 원자 단위
+- **"모든 걸 다 처리하는가?"에 대한 명확화**:
+  "컴포넌트 하나가 런타임 Landscape 동작을 다 책임진다"는 단순화된 표현이지만, 실제로는 **데이터 소유자**일 뿐이고 각 관심사는 **전문 컴포넌트/헬퍼에 위임**됩니다:
+  
+  | 관심사 | 실제 처리 주체 | ULandscapeComponent의 역할 |
+  |-------|-------------|--------------------------|
+  | 데이터 보유 | **ULandscapeComponent 자신** | Heightmap/Weightmap 텍스처, 머티리얼 인스턴스, 레이어 할당 |
+  | 렌더링 | **`FLandscapeComponentSceneProxy`** (렌더 스레드) | 컴포넌트가 `CreateSceneProxy()` 시점에 이 프록시를 생성·위임 |
+  | 물리/콜리전 | **`ULandscapeHeightfieldCollisionComponent`** (별도 컴포넌트) | 컴포넌트가 `CollisionComponentRef`로 짝 관리 |
+  | LOD 선택 | **`FLandscapeRenderSystem`** (전역) + Scene Proxy | 공유 속성과 거리 정보만 제공 |
+  | Nanite 렌더 | **`ULandscapeNaniteComponent`** (선택적, StaticMesh 기반) | 컴포넌트는 소스 데이터만 제공, Nanite 빌드 경로는 별도 |
+  | 편집 시점 데이터 | `LayersData: TMap<FGuid, FLandscapeLayerComponentData>` | 각 편집 레이어별 기여분을 컴포넌트에 저장 |
+  | 최종 텍스처 병합 | **`ALandscape`의 BatchedMerge 파이프라인** | 병합 결과가 `HeightmapTexture`/`WeightmapTextures`에 resolve됨 |
+  | 그래스 생성 | **`ULandscapeSubsystem::GrassMapsBuilder`** | 컴포넌트는 `GrassData` 캐시만 제공 |
+  
+  즉 컴포넌트는 **"타일 하나의 모든 데이터를 한 곳에 모은 컨테이너 + 전문 헬퍼 스폰 지점"**이고, 실제 처리 로직은 Scene Proxy / Collision Component / Subsystem / 마스터 `ALandscape`의 머지 파이프라인에 분산됩니다.
 - **섹션·서브섹션 설정**:
   - `int32 ComponentSizeQuads` — 이 컴포넌트의 quad 개수 (예: 63, 127)
   - `int32 SubsectionSizeQuads` — 서브섹션 quad 수 (`+1`이 2의 거듭제곱)
