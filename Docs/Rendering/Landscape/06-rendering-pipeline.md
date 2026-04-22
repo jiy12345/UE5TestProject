@@ -516,6 +516,26 @@ class ULandscapeMaterialInstanceConstant : public UMaterialInstanceConstant
 
 왜 파생인가: 일반 MIC의 텍스처 스트리밍 로직은 **컴포넌트 단위로 가시 거리/면적을 계산**하는데, Landscape는 "거대한 평면이라 언제나 어느 정도 보인다"는 특성 때문에 **별도 우선순위 규칙**이 필요합니다. 이걸 `TextureStreamingInfo`로 커스터마이즈합니다.
 
+#### 좀 더 자세히 — 일반 MIC 스트리밍이 Landscape에 안 맞는 이유
+
+**일반 UE 텍스처 스트리밍의 작동 방식**: 각 렌더 프리미티브가 "카메라에서 얼마나 멀고, 화면에 얼마나 크게 보이는지"를 계산해 **필요한 밉 레벨**을 결정합니다. 예:
+- 작은 소품이 화면에 손톱만큼만 보이면 → 저해상도 밉만 필요 → 고해상도 밉은 디스크에 방치
+- 캐릭터가 가까이 있으면 → 고해상도 밉 로드
+
+이 로직이 **컴포넌트(프리미티브) 단위로 가시 거리/면적을 독립적으로 판단**한다는 게 핵심입니다.
+
+**Landscape에서 이게 문제인 이유**:
+1. **"항상 보임" 특성**: 지형은 가까운 타일도 먼 타일도 같이 한 화면에 잡힘. 각 타일의 화면 비중이 작더라도 누적하면 **화면 전체**를 덮음 → 일반 로직은 "화면 작으니 낮은 밉으로 충분"이라고 판단하지만 실제로는 그 타일이 **플레이어 바로 앞에 있을 수** 있음.
+2. **텍스처가 재질뿐 아니라 지오메트리**: Landscape의 Heightmap 텍스처는 단순 재질이 아니라 **정점 Z를 결정**하는 지오메트리 텍스처. 저밉으로 로드되면 **지형 형태 자체가 뭉개짐** → 캐릭터 이동에 영향. 일반 스트리밍처럼 "적당한 밉" 취급하면 안 됨.
+3. **밉 간 품질 격차 민감**: 일반 재질 텍스처는 저밉으로 가도 texel 블러 정도지만, Heightmap은 **1/2 해상도만 되어도 지형 엣지가 눈에 띄게 각짐**.
+
+**`FLandscapeTextureStreamingInfo`가 하는 일**:
+- **LOD 별 텍스처 대응 정보**: 각 LOD에서 어느 밉을 최소한 로드해야 하는지 사전 명시.
+- **강제 최소 밉**: Landscape 텍스처는 저밉으로 언로드되지 않도록 강제. 예: "이 heightmap은 최소 밉 3까지만 unload 가능" 식.
+- **Landscape 전용 스트리밍 매니저와 연동**: `ULandscapeSubsystem::TextureStreamingManager`가 각 컴포넌트의 실질 화면 비중(= 카메라 거리 × 컴포넌트 크기)을 집계해 일반 시스템보다 **Landscape-특화 우선순위**를 계산.
+
+결과적으로 Landscape 텍스처는 일반 텍스처처럼 "화면에 작아 보이니 저밉으로 전환" 당하지 않고, **지형 품질을 보장할 수준의 밉**을 유지합니다. 대신 그 만큼 메모리를 확보해야 하므로, 프로젝트 설정에서 Landscape 텍스처 전용 스트리밍 풀 크기를 분리해 관리하는 것이 권장됩니다.
+
 ### 4.1 LOD별 재질
 
 ```cpp
@@ -550,7 +570,44 @@ FBox CachedLocalBox;
 
 ### 5.2 NegativeZBoundsExtension / PositiveZBoundsExtension
 
-World Position Offset으로 지형을 왜곡할 때 바운드가 과소평가되면 화면 밖 클립이 생기므로, **수동 바운드 확장**을 지원합니다:
+#### "World Position Offset으로 지형을 왜곡" 문장 풀어 설명
+
+**World Position Offset (WPO)**: UE 머티리얼 그래프에서 정점 셰이더가 각 정점의 위치를 **런타임에 변형**할 수 있게 하는 노드. 예:
+
+- 물결 애니메이션: 강 지역의 지형 정점을 sin파로 흔들어 파도 표현
+- 바람에 흔들리는 풀: 정점을 시간에 따라 좌우로 밀어냄
+- 동적 변형: 게임플레이 이벤트에 따라 땅이 솟아오르거나 가라앉는 효과
+- 폭발 충격파: 정점을 중심 바깥으로 순간적으로 밀어냄
+
+즉 **Heightmap에 저장된 "정적 Z"에 더해, 머티리얼이 런타임에 "추가 Δ위치"를 정점에 더하는** 기능입니다.
+
+#### 바운드가 과소평가되는 이유
+
+프러스텀 컬링은 "이 프리미티브가 카메라에 보이는가"를 **바운딩 박스(AABB)로 빠르게 판정**하는 과정입니다. Landscape의 경우:
+
+- **Heightmap이 머지 완료되면** `CachedLocalBox`가 **실제 정점 Z 최대·최소**로 계산되어 저장됨
+- 이 바운드가 프러스텀 테스트에 사용됨
+- 프러스텀 바깥에 있으면 드로우 콜 자체 스킵
+
+**문제**: WPO가 런타임에 정점을 **바운드 바깥으로 밀어낼 수** 있습니다. 예:
+- Heightmap 기준 최고 Z = +100cm
+- WPO로 "파도치는 강"이 +300cm까지 올라감
+- 하지만 `CachedLocalBox`는 여전히 Z=+100cm 기준
+- 결과: **카메라가 지형 위로 올라가 내려다볼 때**, 실제로는 파도가 화면에 보여야 하는데 프러스텀 컬링이 "바운드 밖이니 안 보임"으로 오판 → **클리핑(짤림) 발생**
+
+#### NegativeZBoundsExtension / PositiveZBoundsExtension가 하는 일
+
+```cpp
+// LandscapeComponent.h:607-611
+float NegativeZBoundsExtension;  // 아래쪽 바운드 추가 확장량
+float PositiveZBoundsExtension;  // 위쪽 바운드 추가 확장량
+```
+
+사용자가 "WPO가 최대 얼마나 정점을 밀어낼지"를 알고 있다면, 그 만큼 **수동으로 바운드를 미리 확장**해줍니다. 예: 위 파도 예시에서 `PositiveZBoundsExtension = 200`을 설정하면 `CachedLocalBox`의 상단이 300cm까지 커져 프러스텀 컬링이 올바르게 동작.
+
+즉 이 두 프로퍼티는 **"머티리얼이 정점을 얼마나 늘릴 수 있는지에 대한 힌트"**이며, 수동 설정이 필요한 이유는 엔진이 WPO 결과를 컴파일 타임에 정확히 예측하기 어렵기 때문입니다. WPO를 쓰지 않으면 0으로 두면 됩니다.
+
+기본 `CachedLocalBox`와 WPO 확장의 관계:
 
 ```cpp
 // LandscapeComponent.h:607-611
@@ -570,9 +627,70 @@ float PositiveZBoundsExtension;
 
 렌더 시점에 프록시의 현재 LOD 값(실수)을 기반으로 해당하는 batch element를 선택·제출. GPU는 **이미 준비된 인덱스 버퍼 범위**(`FLandscapeIndexRanges`)만 읽어 드로우.
 
+#### "서브섹션이 뭐고 누가 나누는지" — BatchedMerge와 무관함을 명확히
+
+먼저 중요한 분리: **서브섹션은 BatchedMerge(편집 시점)와 관계가 없습니다.** BatchedMerge 결과가 서브섹션이 되는 게 아닙니다. 두 개념은 완전히 다른 축입니다.
+
+| 개념 | 언제 | 나누는 주체 | 목적 |
+|------|------|----------|------|
+| **BatchedMerge의 Batch** | 편집 시점 | 머지 파이프라인 내부 (영향받은 컴포넌트 집합을 공간 근접성 + RT 크기로 분할) | 여러 Edit Layer를 GPU에서 합성할 때 RT 한 장에 묶을 컴포넌트 단위 |
+| **서브섹션(Subsection)** | 런타임 렌더 | 컴포넌트 **정의 시 고정된 속성** (`NumSubsections = 1 or 2`) | 컴포넌트 내부를 더 세분화한 렌더 배치 요소 |
+
+**서브섹션의 의미**:
+- `ULandscapeComponent::NumSubsections`가 `1`이면 컴포넌트 전체가 1개 서브섹션 = 1개 배치 요소
+- `2`면 컴포넌트가 2×2로 나뉘어 **4개 서브섹션 = 4개 배치 요소**
+- 이 값은 Landscape 생성 시 결정되고 (에디터 New Landscape 대화상자) **이후 바뀌지 않음** — 컴포넌트 저장 구조의 일부
+
+**왜 나누는가** (재확인):
+1. **서브섹션마다 독립 LOD** — 같은 컴포넌트에서 가까운 서브섹션은 고해상도, 먼 서브섹션은 저해상도
+2. **LOD 모핑 구간 축소** — 컴포넌트 전체를 한 LOD로 묶는 것보다 전환이 더 국소적
+3. **더 세밀한 프러스텀 컬링** — 일부가 화면 밖이면 그 서브섹션만 스킵
+
+**누가 나누는가** — 컴포넌트 자체가 **스스로의 속성**으로 들고 있음:
+- `ULandscapeComponent::NumSubsections` 값이 그 컴포넌트의 "서브섹션 분할 수"
+- 런타임에 `FLandscapeComponentSceneProxy`가 이 값을 보고 batch element 수를 결정
+- GPU에는 같은 정점 버퍼를 공유하되, 각 서브섹션마다 **다른 인덱스 범위 + 다른 UV 오프셋**으로 드로우
+
+**BatchedMerge와 서브섹션이 교차하는 지점** (혼동 방지):
+- BatchedMerge는 편집 시점 **"RT에 어느 컴포넌트의 어느 서브섹션 영역을 그릴지"**를 결정할 때 컴포넌트 내 서브섹션 단위까지 내려감 (`FMergeRenderBatch::ComputeSubsectionRects`).
+- 즉 BatchedMerge가 **"서브섹션 구조를 참조"하긴** 하지만, BatchedMerge 결과가 서브섹션을 "만드는" 게 아니고, **이미 정해진 서브섹션 구조에 맞춰 RT 영역을 할당**하는 것입니다.
+
+쉽게 말해: **서브섹션은 컴포넌트가 태어날 때 결정되는 고정 분할**이고, BatchedMerge·렌더링은 그 분할을 **참조**해 자기 작업 단위를 정할 뿐입니다.
+
 ### 6.2 GPU Scene 제약
 
-현재 5.7 기준 **Classic Landscape는 모바일에서 GPU Scene을 쓰지 않습니다**. 일부 기능(프리컴퓨트 조명)은 이에 따라 우회 경로를 거칩니다:
+#### GPU Scene이 뭐고, 모바일이 뭐고, 안 쓰면 뭐가 문제인가
+
+**모바일(Mobile)** — UE 맥락에서 "모바일 플랫폼"은 iOS/Android/스위치 같은 **SM5 이하 피처 레벨** 환경을 뜻합니다. 데스크톱 PC/콘솔(SM5, SM6)과 별개 렌더 경로를 가지는 축소판 파이프라인.
+
+**GPU Scene**: UE5에서 도입된 **프리미티브 데이터 구조의 GPU-side 대량 표현**입니다. 요약:
+- 기존: 각 프리미티브(메시 등)의 트랜스폼·머티리얼 상수를 드로우 때마다 CPU → GPU로 업로드
+- GPU Scene: 모든 프리미티브의 메타데이터(트랜스폼, 바운드, 머티리얼 인덱스 등)를 **GPU 버퍼 하나**에 통째로 보관하고, 드로우는 "이 버퍼의 N번째 엔트리를 써라"라고 인덱스만 넘김
+- 효과: **CPU → GPU 대역폭 대폭 감소**, 드로우 콜당 오버헤드 작아짐, GPU가 직접 프리미티브 컬링/instancing 가능
+
+**Nanite, VSM(Virtual Shadow Maps), 그 외 UE5 신기능들의 대부분이 GPU Scene을 전제로 설계**되었습니다. 즉 "이 프리미티브는 GPU Scene에 등록되어 있다"가 기본 전제.
+
+**Landscape의 Classic 경로가 모바일 GPU Scene을 쓰지 않는 현재 상태**:
+```cpp
+// LandscapeRender.h:726-730 (발췌)
+if (FeatureLevel >= ERHIFeatureLevel::SM5 && !bVFRequiresPrimitiveUniformBuffer)
+{
+    // Landscape does not support GPUScene on mobile
+    bCanUsePrecomputedLightingParametersFromGPUScene = true;
+}
+```
+
+즉 **Desktop/Console(SM5+)**에서는 GPU Scene을 활용 가능하고, **Mobile**에서는 Landscape Classic 경로가 GPU Scene을 쓰지 못하는 상태 — 모바일 Landscape는 전통적인 "프리미티브 UB(Uniform Buffer)를 드로우마다 바인딩" 경로로 동작.
+
+**안 쓰면 불이익**:
+- **CPU-GPU 전송 비용** — 컴포넌트마다 프리미티브 UB를 CPU에서 업로드해야 함 (모바일에서 렌더 스레드 부담)
+- **Precomputed Lighting 경로 차선책** — 프리컴퓨트 조명 파라미터가 GPU Scene을 타지 못해 우회 버퍼 구조로 대체
+- **최신 최적화 못 받음** — Nanite(모바일 지원 추가 중), VSM, GPU-driven culling 같은 기능들과의 통합이 복잡해짐
+- **Instancing/Indirect Draw 제약** — GPU-side instancing을 Landscape 컴포넌트에 적용하기 어려움
+
+**TODO 주석에 "enable when GPUScene is implemented on mobile"**이라고 있어, **향후 버전에서 모바일 GPU Scene 지원이 추가되면 Landscape Classic 경로도 이 최적화를 받을 예정**입니다. 당장은 모바일 대형 지형 프로젝트에서 Landscape 성능 분석 시 이 제약을 염두에 둘 것.
+
+**Desktop/Console에서는**: 이 제약이 없으므로 이 섹션은 모바일에 한정된 논의입니다.
 
 ```cpp
 // LandscapeRender.h:726-730
@@ -608,6 +726,65 @@ extern LANDSCAPE_API int32 GLandscapeViewMode;
 ```
 
 에디터에서 `Landscape Mode → View Mode` 메뉴로 전환. 프록시가 `GLandscapeViewMode` 전역을 참조해 셰이더/재질을 디버그 버전으로 교체합니다.
+
+## 7.5 편집 시점 상세 흐름 (렌더 관점)
+
+아래 §8의 요약 다이어그램에서 **"편집 시점"** 블록이 작아 잘 안 보이니, 렌더 파이프라인과 연결되는 흐름만 떼어내어 상세 다이어그램으로 재표현합니다.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User as 사용자
+    participant EdMode as LandscapeEdMode<br/>(브러시/페인트)
+    participant LS as ALandscape<br/>(마스터)
+    participant Merge as BatchedMerge<br/>(GPU 파이프라인)
+    participant Comp as ULandscapeComponent
+    participant Proxy as FLandscapeComponent<br/>SceneProxy
+    participant RT as 렌더 스레드
+    
+    User->>EdMode: 브러시 드래그 (스컬프트/페인트)
+    EdMode->>LS: RequestLayersContentUpdate(mode)
+    Note over LS: 다음 틱에 머지 실행 예약
+    
+    LS->>LS: UpdateLayersContent() (에디터 틱)
+    LS->>Merge: RegenerateLayersHeightmaps() → PerformLayersHeightmapsBatchedMerge()
+    
+    Merge->>Merge: FMergeContext 생성 (Landscape 전역 메타)
+    Merge->>Merge: 영향 컴포넌트 집합 → 여러 FMergeRenderBatch로 분할
+    
+    loop 각 배치
+        Merge->>RT: 게임 스레드: RenderSteps 기록 (명령만)
+        RT->>RT: EndRenderCommandRecorder → FRDG Builder 생성·실행
+        RT-->>Merge: SignalBatchMergeGroupDone
+        Merge->>Comp: RT → 각 HeightmapTexture/WeightmapTextures에 copy-back
+    end
+    
+    Comp->>Comp: CachedLocalBox 재계산 (실제 높이 범위 반영)
+    Comp->>Proxy: MarkRenderStateDirty() → 렌더 상태 갱신 요청
+    
+    Note over Proxy: 다음 프레임의 렌더에서:
+    Proxy->>RT: Scene Proxy 재생성 또는 파라미터 업데이트
+    RT->>RT: 새 Heightmap 텍스처 바인딩 → VS가 변경된 높이 샘플링
+    
+    opt 콜리전이 필요한 경우
+        Comp->>Comp: RecreateCollision() → Chaos FHeightField 재빌드
+        Note over Comp: (§08 Collision 문서 참고)
+    end
+    
+    opt CPU가 값 필요한 경우
+        Merge->>Merge: FLandscapeEditLayerReadback으로 GPU→CPU 비동기 복사
+        Note over Merge: (undo, 저장, BP 쿼리 등에 사용)
+    end
+```
+
+**핵심 지점**:
+1. **사용자 → EdMode → ALandscape → BatchedMerge → Components** 순의 호출 체인
+2. **BatchedMerge 내부**에서 게임 스레드는 **명령만 기록**, 실제 GPU 실행은 렌더 스레드에서 일괄
+3. 머지 결과가 **컴포넌트별 HeightmapTexture에 resolve**되면 렌더 상태 더티 플래그 → 다음 프레임 렌더에 반영
+4. **렌더링은 텍스처 읽기 기반**이므로 텍스처만 갱신되면 Scene Proxy 재생성 없이도 다음 드로우에 새 높이가 반영될 수 있음 (단순 파라미터 변경 시)
+5. 콜리전·Readback은 별도 트리거 (항상 도는 게 아니라 필요할 때)
+
+이 흐름에서 "편집"이 결국 **Heightmap 텍스처 내용 변경**으로 요약되고, 런타임 렌더는 **단순히 변경된 텍스처를 읽을 뿐**이라는 점이 Landscape의 편집-렌더 분리 설계의 핵심입니다.
 
 ## 8. 전체 흐름 요약
 
