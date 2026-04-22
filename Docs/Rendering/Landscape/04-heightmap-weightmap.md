@@ -262,6 +262,33 @@ uint16 Height = Clamp(월드 Z × 128 + 32768, 0, 65535)
 
 즉 **컴포넌트 로컬 Z 범위는 약 ±256cm 기본**입니다. 실제 월드 Z 범위는 액터의 **Scale Z**로 확장합니다 — 예를 들어 `Scale Z = 100`이면 ±25600cm (±256m) 높이 표현 가능.
 
+#### Scale Z가 결국 "지형에서 표현 가능한 높이 범위"를 결정
+
+답은 "네, 결국 그렇습니다." 계산 흐름은:
+
+```
+텍스처 uint16 값
+      ↓ GetLocalHeight:  (uint16 - 32768) × LANDSCAPE_ZSCALE
+로컬 Z (cm, 컴포넌트 자체 좌표계)
+      ↓ 액터 Transform의 Scale Z 곱
+월드 Z (cm, 실제 게임 세계 좌표)
+```
+
+따라서 최종 월드 Z 범위 = **`로컬 Z 범위(±256cm) × Scale Z`**입니다.
+
+| Scale Z | 월드 Z 범위 | 최소 단계 | 사용 예 |
+|---|---|---|---|
+| **1** (기본) | ±256 cm | 0.78 cm | 소규모 공원/실내 |
+| **10** | ±25.6 m | 7.8 cm | 작은 언덕/마을 |
+| **100** | ±256 m | 78 cm | 일반 야외 맵 (디폴트와 가까운 설정) |
+| **1000** | ±2560 m (2.56 km) | 7.8 m | 산악·개방 월드 |
+
+Landscape를 에디터에서 처음 만들 때 **"Resolution" + "Section Size" + Scale**을 입력받는데, 이 Scale이 바로 정점 간 거리(XY)와 높이 범위(Z)를 모두 결정합니다. 한 번 정하면 나중에 늘리는 것은 데이터 재임포트가 필요하므로 프로젝트 초기에 신중히 결정해야 합니다.
+
+> **소스 확인 위치**
+> - Actor의 `RootComponent` `RelativeScale3D.Z`가 곱해지는 지점은 일반 UE Transform 흐름 — Landscape 전용 코드 아님
+> - Landscape 편집 기본값: `FActorSpawnParameters` + `ALandscape::PostEditImport`에서 기본 Scale 설정
+
 #### 높이를 더 세밀하게 조절하고 싶으면 — 정밀도 트레이드오프
 
 질문: "로컬 ±256cm / 0.78cm 단계만으로는 부족한 장면이 있다. 어떻게 대처?"
@@ -305,6 +332,54 @@ FORCEINLINE FVector UnpackNormal(const FColor& InHeightmapSample)
 - X/Y만 저장하고 **Z는 단위 벡터 조건 `X² + Y² + Z² = 1`로 역산**
 - 노멀 Z는 항상 양수라는 암묵 가정 (지형은 "위를 향함")
 - 음수 Z 노멀(오버행)은 이 표현으로는 불가능 — 그런 경우는 StaticMesh로 풀어야 함
+
+#### 노멀 Z 역산을 단계별로
+
+코드 한 줄로 보면 간단하지만 풀어보면:
+
+```cpp
+Normal.Z = FMath::Sqrt(FMath::Max(1.0f - (FMath::Square(Normal.X) + FMath::Square(Normal.Y)), 0.0f));
+```
+
+**전제**: 노멀 벡터는 **단위 벡터(길이 1)**. 즉 `X² + Y² + Z² = 1`.
+
+**역산 과정**:
+
+1. 단위 벡터 정의를 Z에 대해 정리:
+   ```
+   X² + Y² + Z² = 1
+   Z² = 1 - X² - Y²
+   Z  = √(1 - X² - Y²)
+   ```
+
+2. 그런데 부동소수점 연산에서 `X²+Y²`가 **아주 약간 1을 넘을 수** 있음(저장·복원 과정의 오차, 텍스처 필터링 보간 등). 그럴 때 `1 - X² - Y²`가 음수가 되어 `√음수 = NaN`이 되면 렌더링이 깨짐.
+   ```
+   FMath::Max(1 - X² - Y², 0)  ← 음수면 0으로 클램프 (Z=0, 즉 수평 노멀로 처리)
+   ```
+
+3. 마지막으로 `FMath::Sqrt`로 Z 값 획득. 지형은 "위를 향함" 전제라 **Z의 부호는 항상 양수**로 결정됨 (√는 양의 근만 반환).
+
+**시각적 해석**:
+
+```
+     ↑ Z (always + for landscape)
+     │
+     │   /  N = (X, Y, Z)
+     │  /   |N| = 1 (단위 벡터)
+     │ /    
+     │/_____→ (X² + Y²): 수평 성분의 제곱 합
+   원점    
+   
+  Z = √(1 − (X² + Y²))
+    ↑
+    단위 구에서 Z 성분 복원
+```
+
+즉 **X와 Y가 작으면**(수평 성분 작음 → 거의 수직 위) Z ≈ 1, **X·Y 조합이 커질수록**(경사 심함) Z가 작아지며 0에 근접. `X² + Y² > 1`이면 애초에 "노멀"로서 유효하지 않은 상태(오차)라 0으로 clamp.
+
+**비교 — 일반 TangentSpace Normal Map**:
+
+일반 노말맵은 RGB 3채널에 X/Y/Z를 다 넣거나, BC5 블록 압축에선 X/Y만 넣고 Z는 셰이더에서 역산합니다. Landscape는 후자와 같은 방식이되 **Heightmap의 B/A 채널을 "대여"**해서 메모리를 아낍니다. 대신 노멀 XY 정밀도가 8bit (약 1/127 단계)로 제한되지만, 지형 같이 완만한 기울기에선 충분.
 
 왜 2채널에만 저장하는가: Z를 별도 저장할 만큼 정밀도가 필요 없고, **텍스처 2채널을 높이에 양보**해야 16비트 정밀도가 나옵니다. 0..255 → −1..+1 매핑이므로 노멀 XY는 약 1/127 정밀도.
 
@@ -413,6 +488,52 @@ struct FWeightmapLayerAllocationInfo
 ```
 
 페인트 도구는 한 레이어를 칠할 때 다른 레이어들의 가중치를 **비례하여 감소**시켜 합을 1로 유지합니다. 이 정책이 있기 때문에 재질 블렌딩이 "각 레이어 × 가중치" 합으로 간단해집니다.
+
+#### "모든 레이어의 색을 단순히 섞는다"가 맞는가
+
+결론: **색만 섞는 게 아니라 각 레이어의 전체 "재질 속성"(Color, Normal, Roughness, Specular, AO 등)을 가중 평균**합니다. 블렌딩 단위는 픽셀마다 다르고, 각 속성별로 독립 계산.
+
+**실제 픽셀 셰이더에서의 계산(개념)**:
+
+```hlsl
+// 픽셀 위치 (u, v)에서
+// 1. Weightmap에서 레이어 가중치 샘플링
+float wGrass = SampleWeight("Grass", uv);   // 0..1
+float wRock  = SampleWeight("Rock",  uv);
+float wDirt  = SampleWeight("Dirt",  uv);
+// (각 레이어마다 합이 1이 되도록 정규화된 상태)
+
+// 2. 각 레이어의 재질 속성들을 가중 평균
+float3 BaseColor = wGrass * GrassBaseColor(uv)
+                 + wRock  * RockBaseColor(uv)
+                 + wDirt  * DirtBaseColor(uv);
+
+float3 Normal    = wGrass * GrassNormal(uv)
+                 + wRock  * RockNormal(uv)
+                 + wDirt  * DirtNormal(uv);
+normalize(Normal);  // 노멀은 길이 재보정
+
+float Roughness  = wGrass * GrassRoughness(uv) + ...;
+float Specular   = wGrass * GrassSpecular(uv) + ...;
+// ...AO, Metallic 등 모든 PBR 속성 동일
+```
+
+**즉 "색만" 섞는 게 아니라**:
+- **BaseColor** (Albedo 텍스처)
+- **Normal** (노말맵, Tangent 공간)
+- **Roughness / Specular / Metallic / AO** (PBR 속성들)
+- **Height blend 고급 모드**에서는 "높이가 더 높은 레이어가 우선" 같은 비선형 블렌딩도
+
+따라서 **한 픽셀에 3개 레이어가 블렌딩된다면**, 그 픽셀의 GPU 비용은 "3개 레이어 × 각자 텍스처 샘플들(색/노말/러프니스/…)"입니다. 많이 겹칠수록 셰이더 비용 증가.
+
+**Material Layer Blending 모드**:
+- **`WeightBlend` (기본)**: 위 수식대로 가중 평균 (합 1)
+- **`LayerBlend` (구형)**: 알파 오버 방식 (먼저 레이어 위에 얹어 쌓음)
+- **`HeightBlend` (고급)**: 각 레이어에 "이 레이어의 가상 높이" 정보를 추가 저장해, 가중치가 비슷할 때 **더 높은 가상 높이를 가진 레이어가 우선** 표시 (자갈이 모래 사이로 튀어나오는 자연스러운 효과)
+
+재질 노드 그래프에서는 **`Landscape Layer Blend` 노드** 또는 **`Layer Blend` 함수**를 통해 선언하고, UE가 가중치 계산 부분을 자동 삽입해줍니다.
+
+결론: "단순히 색 섞음"은 **기본 개념 이해**로는 맞지만, 실제로는 **PBR 속성 전체를 레이어별 가중 평균**하고, 재질 설정에 따라 Height blend 같은 **비선형 강화**도 가능합니다.
 
 > **소스 확인 위치**
 > - `Engine/Source/Runtime/Landscape/Classes/LandscapeComponent.h:141-187` — `FWeightmapLayerAllocationInfo`
