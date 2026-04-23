@@ -413,6 +413,61 @@ void SpeculativelyLoadAsyncDDCCollsionData();
 
 이로써 **에디터 재시작 시 또는 스트리밍 시** 콜리전 생성에 드는 시간이 최소화됩니다.
 
+#### "있을 것 같다"를 어떻게 아는가 — Speculative의 실체
+
+"투기적(speculative)" 로드가 동작하는 원리는 **콘텐츠 해시 기반 예측**입니다.
+
+**핵심 아이디어**:
+- 콜리전 컴포넌트는 로드 시점에 **자기 데이터의 해시 (`CollisionHash`)를 계산**할 수 있음 — 이 해시는 높이 데이터·물리 재질 배열·레이어 정보 등 쿠킹 입력으로부터 결정됨
+- DDC는 **해시를 키로 한 key-value 캐시** → "이 해시에 해당하는 쿠킹된 바이너리가 이전에 저장되어 있으면 가져와라" 질의가 가능
+- "있을 것 같다"의 의미: **해시가 계산되면, 그 해시가 과거 어느 시점에 저장되었는지 보장은 없지만, 같은 내용을 이전에도 열었던 개발자/빌드 파이프라인이라면 확률적으로 높음**
+
+**따라서 실제 흐름**:
+
+```cpp
+// 1. 컴포넌트 로드 — 아직 Register 전 (OnRegister 호출 안 됨)
+void ULandscapeHeightfieldCollisionComponent::PostLoad()
+{
+    // 2. 콘텐츠로부터 해시를 계산 (`CollisionHash` 채움)
+    ComputeCollisionHash();
+    
+    // 3. DDC에 "이 해시의 쿠킹 데이터 있나?" 비동기 질의 시작
+    //    → 있으면 백그라운드 스레드에서 로드가 진행됨 (OnRegister까지 걸리는 시간 동안)
+    //    → 없으면 아무 일도 안 일어남 (무비용)
+    SpeculativelyLoadAsyncDDCCollsionData();
+}
+
+// 4. 이후 액터 Register 시점
+void ULandscapeHeightfieldCollisionComponent::OnRegister()
+{
+    // 5. DDC 비동기 로드 결과 체크
+    if (SpeculativeDDCRequest && SpeculativeDDCRequest->Poll()) {
+        // 6a. 이미 완료 — 그대로 Chaos 객체로 복원 (빠름)
+        CreateCollisionObjectFromDDC(SpeculativeDDCRequest->GetData());
+    } else {
+        // 6b. 아직 진행 중이거나 DDC 미스 — 쿠킹 실행 또는 대기
+        CookCollisionData(...);
+    }
+}
+```
+
+**"있을 것 같다"가 맞춰지는 확률**:
+
+| 상황 | DDC hit 확률 |
+|------|-----------|
+| **같은 개발자가 같은 머신에서 두 번째 로드** | 매우 높음 (로컬 DDC에 이전 쿠킹 결과 있음) |
+| **팀 공유 DDC 서버를 쓰는 프로젝트** | 높음 (다른 팀원이 이미 쿠킹한 적 있음) |
+| **처음 컴포넌트를 만든 직후** | 낮음 (DDC 미스 → 쿠킹 발생 → 결과 저장) |
+| **Landscape를 대규모 편집한 직후** | 해시가 바뀐 경우 낮음, 안 바뀐 부분은 높음 |
+| **CI/쿠킹 빌드 과정** | 매우 높음 (빌드가 모든 해시를 미리 쿠킹·저장) |
+
+**핵심 포인트** — "있을 것 같다"의 비용 균형:
+- **DDC hit이면**: 로드 스레드에서 디스크/원격 fetching만 하면 되므로 비용 낮음. 로드 힛치 크게 감소.
+- **DDC 미스면**: 비동기 질의가 "데이터 없음"을 반환. 그 동안 다른 스레드 유휴 자원만 썼을 뿐이라 **불이익 없음**.
+- 즉 **Speculative = "낮은 비용으로 높은 이득을 노리는 낙관적 프리페치"**. 실패해도 손해 없고, 성공하면 힛치 제거. 근거가 "확실한 예측"이 아니라 "비동기 질의는 싸다"는 계산 위에서 동작하는 것입니다.
+
+**DDC 자체에 대해**: Derived Data Cache = UE가 "원본 에셋으로부터 파생된 데이터(쿠킹 결과, 셰이더 컴파일 결과, Nanite 빌드 등)"를 키-값으로 저장하는 **영속 캐시**. 로컬(디스크) 또는 공유(네트워크) 형태로 존재. 키는 입력 해시, 값은 파생 바이너리. 쿠킹·셰이더 컴파일 같은 고비용 작업을 여러 빌드·개발자 간 공유해 재사용.
+
 > **소스 확인 위치**
 > - `LandscapeHeightfieldCollisionComponent.h:318` — `RecreateCollision`
 > - `LandscapeHeightfieldCollisionComponent.h:249` — `UpdateHeightfieldRegion`
