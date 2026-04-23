@@ -165,6 +165,39 @@ virtual void SetSharedPropertyOverride(const FName& InPropertyName, const bool b
 
 프로퍼티 이름이 이 집합에 있으면 "마스터 값 무시, 로컬 값 사용"이고, 없으면 마스터 값을 따릅니다. 이 메커니즘으로 **특정 셀만 다른 재질/설정을 적용**할 수 있지만, 과도하게 쓰면 공유의 이점이 무너지므로 예외적 사용 권장.
 
+#### 실제로 어떻게 사용하는가 — 코드 편집 vs 에디터 UI
+
+두 가지 경로 모두 지원되며, 메커니즘은 동일합니다:
+
+**(A) 에디터 UI 경로 (일반 사용자 흐름)**:
+
+1. Outliner/Details에서 특정 `ALandscapeStreamingProxy` 선택
+2. Details 패널에 공유 속성(예: `LandscapeMaterial`)이 **마스터 값이 회색으로 표시**되어 나옴 (상속 상태)
+3. 값 옆의 **작은 화살표/재설정 버튼** 또는 속성 우클릭 → "Override"로 오버라이드 토글
+4. 토글 시 내부적으로 `SetSharedPropertyOverride(FName, true)`가 호출되어 `OverriddenSharedProperties.Add("LandscapeMaterial")` 발생
+5. 이제 이 프록시의 `LandscapeMaterial` 값은 독립적으로 편집 가능 (활성화됨)
+6. 사용자가 새 값을 입력 → 이 프록시 로컬에 저장
+
+즉 UI에서의 "Override" 체크 = `OverriddenSharedProperties` 집합에 프로퍼티 이름 추가 = 이후 로컬 값 사용.
+
+**(B) 코드 경로 (프로그래매틱)**:
+
+```cpp
+// 블루프린트 가능 API나 C++로
+StreamingProxy->SetSharedPropertyOverride(TEXT("LandscapeMaterial"), true);
+StreamingProxy->LandscapeMaterial = MyCustomMaterial;
+StreamingProxy->PostEditChangeProperty(...);  // 에디터 갱신 알림
+```
+
+도구·자동화 스크립트가 여러 프록시의 오버라이드를 일괄 적용할 때 사용. 내부 로직은 UI 경로와 동일 (`SetSharedPropertyOverride` → 집합 갱신 → 값 적용).
+
+**두 경로의 공통점**:
+- 실제로는 **두 단계**: (1) 오버라이드 플래그 활성화 + (2) 로컬 값 설정
+- 오버라이드 플래그만 활성화되고 값은 그대로면, 로컬 사본이 마스터 현재 값으로 "고정" 상태 (이후 마스터가 바뀌어도 반영 안 됨)
+- 오버라이드를 끄면(`Remove`) 다시 마스터 값 상속으로 복귀
+
+즉 `OverriddenSharedProperties`는 **"어떤 속성을 로컬화할지"를 기록하는 메타데이터**이며, 그 자체가 값을 바꾸지는 않습니다. 실제 값은 여전히 프록시의 일반 프로퍼티 필드에 저장되며, 이 집합은 "이 필드를 참조할 때 마스터 대신 로컬 값을 쓰라"는 플래그 역할을 합니다.
+
 ### 3.2 OnProxyFixupSharedData 델리게이트
 
 마스터가 바뀌면 스트리밍 프록시들이 알아야 합니다:
@@ -176,6 +209,27 @@ DECLARE_MULTICAST_DELEGATE_TwoParams(FOnLandscapeProxyFixupSharedDataDelegate,
 ```
 
 프록시가 로드될 때 `FixupOverriddenSharedProperties()`를 통해 마스터 기본값을 다시 흡수하며, 이미 업그레이드된 경우 `bUpgradePropertiesPerformed` 플래그로 중복을 방지.
+
+#### "마스터가 바뀔 일"이 구체적으로 언제인가
+
+거의 다 **에디터 작업** 상황입니다:
+
+| 시점 | 상황 | 예 |
+|------|------|---|
+| **에디터에서 마스터 속성 편집** | 사용자가 Details 패널에서 `LandscapeMaterial` 등 변경 | 지형 전체 재질을 가을 버전으로 교체 |
+| **에디터 Undo/Redo** | 마스터 속성 변경을 되돌리거나 다시 하기 | Ctrl+Z로 재질 교체 취소 |
+| **블루프린트 툴/자동화 스크립트** | 에디터 유틸리티가 여러 속성 일괄 변경 | "모든 Landscape의 LOD 설정 표준화" 툴 |
+| **C++ 에디터 커맨드렛** | 데이터 마이그레이션 시 프로그래매틱 수정 | 5.7 마이그레이션 시 deprecated 속성 값 새 속성으로 이전 |
+| **프록시가 처음 로드되는 순간** | 마스터 값이 프록시에 처음 복사되어야 함 | 월드 열기, WP 셀 스트리밍 인 (주: "마스터 자체는 안 바뀌어도 프록시 로드 시점에 fixup 필요") |
+| **런타임 (드묾)** | 게임 런타임에 `ALandscape` 속성을 블루프린트/C++로 변경 | 게임 내 이벤트로 재질 런타임 스왑 (매우 예외적) |
+
+**전형적 흐름** — 에디터에서 마스터의 `LandscapeMaterial`을 바꿨을 때:
+1. `ALandscape::PostEditChangeProperty` 호출
+2. 이 액터의 `OnLandscapeProxyFixupSharedData` 델리게이트 broadcast
+3. 각 `ALandscapeStreamingProxy`가 자기 `FixupOverriddenSharedProperties()`로 반응 — `OverriddenSharedProperties`에 등록되지 않은 속성들만 마스터 값으로 갱신
+4. 렌더/콜리전 자동 갱신
+
+즉 "마스터가 바뀜"의 실질은 **에디터 편집 이벤트**이고, 게임 런타임에서는 특별한 스크립팅이 있는 경우가 아니면 발생하지 않습니다. 델리게이트는 **"값 변경 사실을 프록시들에게 알리는 브로드캐스트 채널"**이지 "런타임 동적 시스템"이 아닙니다.
 
 ## 4. 스트리밍 인/아웃 플로우
 
@@ -234,6 +288,38 @@ sequenceDiagram
 
 **주의**: 언로드된 프록시의 컴포넌트가 다른 프록시의 **3×3 이웃**에 있으면, 남은 프록시의 노멀 계산이 완료되지 못하고 경계 부분이 미완성 상태로 남을 수 있습니다. 이는 [05-edit-layers.md](05-edit-layers.md) §6에서 언급한 "이웃 없는 컴포넌트는 노멀 갱신 지연" 이슈로 이어집니다.
 
+### 4.3 로드 상태 vs 언로드 상태 비교
+
+로드 시점에 여러 작업이 일어나는 걸 보면 "언로드 중에는 뭘 하고 있나?" 궁금해질 수 있는데, **답은 "거의 아무것도 안 한다(정확히는 존재하지 않는다)"**입니다. 두 상태를 나란히 비교:
+
+| 측면 | 로드 상태 | 언로드 상태 |
+|------|---------|----------|
+| **프록시 액터 존재** | ✅ 월드에 AActor 인스턴스 살아 있음 | ❌ AActor Destroy됨, GC 대상 → 메모리에서 사라짐 |
+| **메모리 점유** | 컴포넌트 + 텍스처 + 콜리전 포함 수~수십 MB | 0 (패키지도 언로드 → `.uasset`이 RAM에 없음) |
+| **Scene Proxy (렌더)** | ✅ 생성됨, 매 프레임 프러스텀 체크 | ❌ 해제됨 |
+| **Heightmap/Weightmap 텍스처** | ✅ GPU에 업로드된 상태 (밉 스트리밍 가동) | ❌ GPU·CPU 양쪽 모두 언로드 |
+| **Collision 컴포넌트** | ✅ 활성, Chaos Heightfield 존재 | ❌ 해제됨 (카메라/플레이어가 그 영역에 못 감) |
+| **Tick/Update** | 텍스처 스트리밍 우선순위 힌트 갱신 등 | 틱 자체 없음 (액터가 없으므로) |
+| **ULandscapeInfo 레지스트리** | ✅ XYtoComponentMap에 등록됨 | ❌ 등록 해제됨 (좌표 쿼리 실패) |
+| **Subsystem Proxies[]** | ✅ 포함됨 | ❌ 제거됨 |
+| **패키지 파일** | 메모리에 로드 | 디스크에 남아 있을 뿐 |
+
+즉 **"언로드 = 존재하지 않음"**이고 "다른 모드로 동작"하는 게 아닙니다. 로드 시 일어나는 작업들(GUID 검증, Info 등록, Scene Proxy 생성, 콜리전 재빌드 등)은 모두 **"없던 것을 만드는" 초기화 과정**이고, 언로드는 **그 정반대의 해체**입니다.
+
+**한 가지 예외 — ALandscape (마스터)**:
+- 마스터 `ALandscape`는 **항상 로드된 상태 유지** (§1에서 `CanChangeIsSpatiallyLoadedFlag() -> false`로 설명)
+- 즉 "언로드"는 `ALandscapeStreamingProxy`에만 해당
+- 마스터는 편집 권한자라 언제나 메모리에 있어야 에디터가 동작
+
+**부분 언로드는 없는가** — 없습니다. 프록시 단위의 all-or-nothing:
+- 같은 프록시의 "이 컴포넌트만 언로드"는 안 됨 (프록시의 UPROPERTY 하드 참조이므로 프록시가 살아 있으면 모든 컴포넌트도 살아 있음)
+- 텍스처 밉 수준의 스트리밍은 별도 시스템이 관리 (§6)
+
+**로드 대기 중 보이는 현상**:
+- 플레이어가 새 영역에 빠르게 진입 → 해당 프록시가 아직 스폰 안 됨 → **지형이 공백 상태**로 몇 프레임 보일 수 있음
+- 저장된 프리로드 힌트나 "Preload Volume" 설정으로 완화
+- Landscape 전용의 특별한 fallback은 없음 (일반 WP 스트리밍과 동일 제약)
+
 > **소스 확인 위치**
 > - `LandscapeInfo.h:406, 409` — `RegisterActor` / `UnregisterActor`
 > - `LandscapeSubsystem.h:110-111` — Subsystem의 `RegisterActor` / `UnregisterActor`
@@ -256,6 +342,26 @@ TSet<TObjectPtr<ALandscapeStreamingProxy>> StreamingProxiesNeedingReregister;
 
 **목적**: LOD 계산 시 "같은 그룹에 속한 이웃 프록시들"을 참조해 LOD 차이를 제한. 같은 `ALandscape` 밑의 프록시들은 기본적으로 같은 그룹에 있고, `SetLODGroupKey`로 다른 그룹에 붙일 수 있습니다 (고급 사용 케이스).
 
+#### LOD 조율 외에 LandscapeGroup이 하는 일
+
+**주된 용도는 LOD 조율**이 맞지만, 그룹 구조가 주는 부차적 이점도 있습니다:
+
+| 용도 | 설명 |
+|------|------|
+| **LOD 이웃 조율 (주 용도)** | 같은 그룹 내 이웃 프록시들의 LOD가 너무 차이 나면 경계 이음새 발생 → 그룹 단위로 LOD 차이 상한 적용 |
+| **공유 LOD 파라미터 액세스** | LOD 계산에 필요한 마스터 속성(`LODDistributionSetting` 등)을 그룹 단위로 한 번만 조회 — 개별 프록시마다 반복 조회 안 해도 됨 |
+| **멀티 Landscape 구분** | 한 월드에 여러 `ALandscape`가 있을 때 (예: 메인 월드 + 배경 월드 + 미니맵 Landscape) 서로의 LOD 정책이 섞이지 않게 격리 |
+| **프록시 위치 변경 추적** | `StreamingProxiesNeedingReregister` 집합으로 이동·그룹키 변경된 프록시를 모아 다음 틱에 그룹 재등록 |
+| **Edge Fixup 조정** | 컴포넌트 경계 정점 공유 유틸(`TickEdgeFixup`)이 그룹 단위로 실행 |
+
+**핵심은 여전히 LOD 조율**입니다 — 다른 용도들은 이 메인 기능의 부산물로 "같은 그룹은 유사 설정을 공유하니 함께 처리하는 게 자연스럽다" 수준입니다.
+
+**"다른 그룹 키"의 실제 활용 사례**:
+- 메인 월드 Landscape + 하늘에 떠 있는 섬 Landscape를 별도 그룹으로 → 둘의 LOD가 서로 영향 안 받음
+- 게임 내 미니 월드 Landscape(예: 인스턴스 던전 안쪽 지형) — 메인 월드와 분리해 LOD 튜닝
+
+대부분의 프로젝트는 **하나의 그룹키만 쓰면 충분**하고, `SetLODGroupKey` 커스터마이징은 드문 고급 사용입니다.
+
 프록시가 이동하거나 그룹 키가 바뀌면 `StreamingProxiesNeedingReregister`에 쌓이고 다음 틱에 그룹 재등록.
 
 > **소스 확인 위치**
@@ -275,6 +381,49 @@ FLandscapeTextureStreamingManager* GetTextureStreamingManager() { return Texture
 ```
 
 Landscape 전용 스트리밍 매니저가 "이 컴포넌트는 지금 화면에 얼마나 보이는가"를 계산해 텍스처 스트리밍 시스템에 **우선순위 힌트**를 제공합니다. 일반 MIC보다 정교한 이유는 Landscape 컴포넌트의 실제 화면 기여가 LOD + 모핑 + 서브섹션 단위로 변하기 때문.
+
+#### "프록시별로 거리가 다른데 밉도 프록시별로 관리하나?" — 프록시 × 컴포넌트 × 텍스처 3단계 관리
+
+정확히는 **프록시별이 아니라 컴포넌트별(= 텍스처별)로 독립 관리**됩니다. 단위 구조:
+
+```
+ALandscapeStreamingProxy [Cell 1,2]
+  ├── ULandscapeComponent (X=4, Y=5)
+  │     ├── HeightmapTexture (이 컴포넌트 전용)   ← 이 텍스처가 자체 밉 체인 보유, 독립 스트리밍
+  │     └── WeightmapTextures[3]                   ← 각자 밉 체인, 독립 스트리밍
+  │
+  ├── ULandscapeComponent (X=4, Y=6)
+  │     ├── HeightmapTexture                       ← 별도 텍스처, 별도 밉 관리
+  │     └── WeightmapTextures[4]
+  │
+  └── ... (셀 내 다른 컴포넌트들)
+```
+
+**관리 축**:
+
+1. **텍스처 단위 (가장 세밀)**:
+   - 각 `UTexture2D`(Heightmap 1장, Weightmap N장)는 자체 밉 체인과 스트리밍 상태 보유
+   - UE 엔진의 **텍스처 스트리밍 시스템**이 기본적으로 관리 (일반 MIC와 같은 기반 시스템)
+
+2. **컴포넌트 단위 (Landscape 전용 힌트)**:
+   - `FLandscapeTextureStreamingManager`가 **각 컴포넌트의 현재 화면 기여도**(카메라 거리·각도·LOD)를 계산
+   - 그 컴포넌트가 "현재 LOD 2로 보임 → Heightmap 밉 2까지는 확실히 필요"를 힌트로 제공
+   - 텍스처 스트리밍 시스템이 이 힌트를 반영해 밉 로드 우선순위 결정
+   - 즉 **같은 프록시 안에서도 컴포넌트마다 다른 밉이 로드될 수 있음** (카메라 가까운 컴포넌트 vs 먼 컴포넌트)
+
+3. **프록시 단위 (그룹핑 수준)**:
+   - 프록시가 통째로 언로드되면 소속 컴포넌트·텍스처 전부 해제 (§4.3)
+   - 프록시 단위 "통합 스트리밍 우선순위" 같은 건 없음 — 개별 컴포넌트·텍스처가 각자 계산됨
+
+**예시 — 카메라가 Cell(1,2) 중앙에 있을 때**:
+- Cell(1,2) 안 컴포넌트 (4,5), (4,6) 둘 다 로드된 프록시에 속함
+- 카메라 거리:
+  - (4,5) = 10m → Heightmap 밉 0 (고해상도) 필요
+  - (4,6) = 50m → Heightmap 밉 3 (저해상도)만 필요
+- 결과: 같은 프록시 내에서도 **(4,5)의 Heightmap은 풀 해상도**, **(4,6)의 Heightmap은 낮은 해상도만** 메모리에 올라감
+- Weightmap 3장도 각자 독립 관리 (모두 같은 컴포넌트에 속하므로 보통 비슷한 밉 선택되지만 필요 시 다를 수 있음)
+
+**결론**: 밉 관리는 **"프록시별"이 아니라 "텍스처별(컴포넌트별)"**로 이루어지고, Landscape 전용 매니저가 **컴포넌트 단위 화면 기여도**를 계산해 세밀한 우선순위 힌트를 제공합니다.
 
 ### 6.2 OnHeightmapStreamed — 스트리밍 완료 알림
 
