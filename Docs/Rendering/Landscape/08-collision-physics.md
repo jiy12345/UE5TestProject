@@ -23,6 +23,33 @@ Landscape의 **렌더링**과 **물리 충돌**은 **서로 다른 데이터 구
 
 ## 2. ULandscapeHeightfieldCollisionComponent
 
+### 2.0 1:1 짝 관계 — ULandscapeComponent당 콜리전 컴포넌트 하나
+
+**네, 각 `ULandscapeComponent`마다 하나의 `ULandscapeHeightfieldCollisionComponent`가 짝으로 붙습니다.** 1:1 매핑:
+
+```
+ALandscapeProxy
+  ├── LandscapeComponents[]         (렌더용, N개)
+  │     ├── Comp0 (XY=0,0)          ←─┐
+  │     ├── Comp1 (XY=1,0)          ←──┼─ 각각 1:1로
+  │     └── ...                         │
+  │                                     │
+  └── CollisionComponents[]         (물리용, 같은 N개)
+        ├── CollComp0 (XY=0,0)      ←─┘  매칭되는 콜리전 컴포넌트
+        ├── CollComp1 (XY=1,0)
+        └── ...
+```
+
+**관계 유지 방법**:
+- `ULandscapeComponent::CollisionComponentRef` → 짝 콜리전 컴포넌트 하드 참조
+- `ULandscapeHeightfieldCollisionComponent::RenderComponentRef` → 반대 방향 하드 참조
+- **동일한 `SectionBaseX/Y` 격자 좌표**로 매칭
+- 둘 다 `ULandscapeInfo`의 별도 맵에 등록:
+  - `XYtoComponentMap` (렌더 컴포넌트)
+  - `XYtoCollisionComponentMap` (콜리전 컴포넌트) — **서버에서도 유효**, 서버는 렌더 컴포넌트 없이 이것만 로드
+
+**예외 — 서버 전용 콜리전**: 데디케이티드 서버는 렌더가 필요 없으므로 `ULandscapeComponent`(렌더용)는 로드하지 않고 `ULandscapeHeightfieldCollisionComponent`만 로드합니다. 이 때문에 서버에서는 `XYtoComponentMap`이 비어 있거나 일부만 채워져 있을 수 있고, 대신 `XYtoCollisionComponentMap`이 물리·내비 쿼리의 주 진입점 역할을 합니다.
+
 ### 2.1 선언 및 핵심 멤버
 
 ```cpp
@@ -59,7 +86,91 @@ class ULandscapeHeightfieldCollisionComponent : public UPrimitiveComponent
 };
 ```
 
+#### 해상도에 따른 성능 차이 — 실제 얼마나 차이 나는가
+
+쿼리 종류와 지형 크기에 따라 차이가 큰데, 체감·벤치 기준으로:
+
+| 항목 | 풀 해상도 (`CollisionSizeQuads = 127`) | 1/2 해상도 (63) | 1/4 해상도 (31) |
+|------|-----|-----|-----|
+| **Heightfield 빌드 시간** | 기준 | ~1/4 | ~1/16 |
+| **메모리 (컴포넌트당)** | ~512 KB | ~128 KB | ~32 KB |
+| **레이캐스트 쿼리 비용** | 기준 | ~1/2 | ~1/4 |
+| **캐릭터 이동 정밀도** | cm 단위 | 수~수십 cm | 수십~수백 cm |
+| **경사면 표현** | 매끄러움 | 약간 각짐 | 명확히 각짐 |
+
+**주의**: 위 수치는 대략적 감각이며, **GPU가 아니라 CPU 쿼리 기준**입니다 (Heightfield는 CPU에서 쿼리되는 물리 구조).
+
+**왜 차이가 나는가**:
+- Chaos Heightfield는 **2D 격자 위의 높이 값 배열 + 이진 서브분할 트리**(BVH 유사)로 저장. 격자 크기가 N이면 트리 노드 수가 O(N²), 깊이 O(log N).
+- 레이캐스트는 이 트리를 타고 내려가며 격자 셀 단위로 높이 비교 → **격자 해상도가 쿼리 시간에 직결**.
+- 메모리도 격자 크기 제곱에 비례.
+
+**실용 권장**:
+
+| 용도 | 권장 해상도 |
+|------|---------|
+| **캐릭터 이동 (Simple Collision)** | 렌더의 **1/4~1/8** (`CollisionMipLevel=2~3`) — 빠른 쿼리, 적당한 정밀도 |
+| **정밀 레이캐스트 (프로젝타일 적중 등)** | 렌더의 **1/2** 정도 (`CollisionMipLevel=1`) — 정확도 필요한 경우 |
+| **모바일** | 렌더의 **1/8** 이상 — CPU 여유 확보 |
+| **정밀 메카닉 (퍼즐 지형 등)** | 렌더 해상도와 **동등** (`CollisionMipLevel=0`) — 비싸지만 필요할 때만 |
+
+기본값은 보통 `CollisionMipLevel=1`(절반) + `SimpleCollisionMipLevel=2`(1/4) 조합으로 충분합니다. 프로파일링으로 물리 쿼리 비용이 문제가 될 때 한 단계 더 낮추는 것이 일반적 튜닝입니다.
+
+#### "CookedCollisionData"가 뭐고, 있으면 런타임에 계산 안 하는가
+
+**쿠킹(cooking)** = 지형의 **원시 16비트 높이 데이터**를 **물리 엔진(Chaos)이 레이캐스트에 쓸 수 있는 실제 바이너리 자료구조**로 변환하는 과정. 즉 "데이터 포맷 변환 + 사전 계산".
+
+```
+원시 Heightfield 높이 데이터 (uint16 배열)
+     ↓ 쿠킹 (CookCollisionData)
+Chaos::FHeightField 바이너리 (공간 분할 트리 + 삼각 인덱스 + 물리재질 매핑)
+     ↓ 저장
+CookedCollisionData: TArray<uint8>
+     ↓ 런타임 로드
+Chaos::FHeightField 인스턴스 (레이캐스트 즉시 가능)
+```
+
+**쿠킹 결과가 저장되어 있으면 런타임에 하는 일**:
+- **안 하는 것**: 16비트 높이 → Chaos 자료구조로의 변환 (BVH 빌드, 삼각분할, 재질 인덱싱)
+- **하는 것**: CookedCollisionData 바이트 배열을 파싱해 `Chaos::FHeightField` 객체로 복원 (비교적 빠른 역직렬화)
+- **효과**: 맵 로드 시 힛치 대폭 감소. 수백 컴포넌트의 콜리전을 초기화해도 부담이 덜함.
+
+**없으면** (런타임 쿠킹 경로):
+- 프록시 로드 시 **즉석에서 쿠킹 수행** → 수십~수백 ms 힛치 발생 가능
+- 그래서 엔진은 **DDC(Derived Data Cache)에 쿠킹 결과를 캐시**하여 재사용:
+  - `SpeculativelyLoadAsyncDDCCollsionData`가 컴포넌트 등록 전에 DDC 비동기 로드 시작
+  - 도착했으면 바로 사용, 없으면 쿠킹 후 저장
+
+즉 **CookedCollisionData는 "미리 구운 결과를 디스크에 저장"**으로, **있으면 런타임은 디시리얼라이즈만**, 없으면 쿠킹이 발생합니다. 게임 빌드에서는 쿠킹 과정에서 모든 Landscape 콜리전이 사전에 쿠킹되므로 런타임 쿠킹은 드문 fallback입니다.
+
 ### 2.2 FHeightfieldGeometryRef — Chaos 지오메트리 래퍼
+
+#### "Chaos 지오메트리"가 뭔가
+
+**Chaos**는 UE5의 **기본 물리 엔진** 이름입니다. UE4 시대의 PhysX(NVIDIA)를 대체해 UE5부터 표준으로 쓰이며, Epic이 직접 개발한 물리 엔진. 이름은 혼돈 이론(chaotic systems)이 아니라 Epic의 내부 작명.
+
+**Chaos 지오메트리(Chaos Geometry)** = Chaos 엔진이 레이캐스트·겹침 검사·관성 계산 등에 사용하는 **"형태를 표현하는 자료구조"**들의 통칭. 형태마다 전용 클래스가 있음:
+
+| Chaos 지오메트리 타입 | 형태 | 사용처 |
+|------|------|------|
+| `Chaos::FSphere` | 구 | 캐릭터 간단 충돌, 파티클 |
+| `Chaos::FBox` | 박스 | 상자, AABB 근사 |
+| `Chaos::FCapsule` | 캡슐 | 캐릭터 콜리전(보통) |
+| `Chaos::FConvex` | 볼록 다면체 | 복잡한 단단한 오브젝트 |
+| **`Chaos::FHeightField`** | **높이 필드** (2D 격자 + Z값) | **지형 콜리전 (Landscape가 이걸 씀)** |
+| `Chaos::FTriangleMesh` | 일반 삼각형 메시 | 복잡한 정적 메시 |
+
+**`Chaos::FHeightField`의 특징**:
+- **메모리 효율**: N×N 격자에서 높이값 N²개만 저장 (삼각형 인덱스 저장 안 함 — 격자라는 "규칙"에서 자동 유도)
+- **빠른 레이캐스트**: 내부 공간 분할 트리(BVH 유사)로 O(log N) 복잡도의 교차 테스트
+- **각 quad별 재질**: `CollisionQuadFlags` 하위 6비트가 각 격자 셀의 물리 재질 인덱스. 히트 위치의 셀 플래그를 조회해 해당 물리 재질 반환
+- **"Hole" 지원**: `QF_NoCollision` 플래그로 셀 단위 물리 비활성화 (Visibility 레이어 구멍)
+
+**FHeightfieldGeometryRef의 역할**:
+Landscape 콜리전 컴포넌트가 Chaos::FHeightField를 "참조 카운트로 공유 가능하게" 래핑한 구조체. 왜 래핑했는가:
+- **스레드 안전성**: 물리 시뮬은 별도 스레드에서 돌아감. Landscape 편집(게임 스레드)과 물리 쿼리(물리 스레드)가 동시에 Heightfield에 접근할 때 **ref-count로 안전하게 생명주기 관리**
+- **Simple + Complex 둘 다**: 한 컴포넌트가 두 개의 Heightfield를 묶어 보유 (단순 쿼리용 + 정밀 쿼리용)
+- **에디터 전용 버전**: 에디터에서 Visibility 레이어 구멍이 반영된 버전을 추가로 보유 (플레이에서는 Complex + Simple만 사용)
 
 ```cpp
 // LandscapeHeightfieldCollisionComponent.h:102
