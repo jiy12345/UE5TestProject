@@ -205,6 +205,48 @@ enum class EHeightfieldSource
 };
 ```
 
+#### "쿼리할 때 이 enum을 함께 보내서 어떤 변형을 쓸지 고르는가"
+
+**네, 그런 API들에서 이 enum을 파라미터로 받아 분기**합니다. Landscape 전용 API 예:
+
+```cpp
+// LandscapeHeightfieldCollisionComponent.h:335-343
+LANDSCAPE_API TOptional<float> GetHeight(float X, float Y, EHeightfieldSource HeightFieldSource);
+LANDSCAPE_API UPhysicalMaterial* GetPhysicalMaterial(float X, float Y, EHeightfieldSource HeightFieldSource);
+
+LANDSCAPE_API bool FillHeightTile(TArrayView<float> Heights, int32 Offset, int32 Stride) const;
+LANDSCAPE_API bool FillMaterialIndexTile(TArrayView<uint8> Materials, int32 Offset, int32 Stride) const;
+```
+
+호출 예:
+```cpp
+// 정밀 레이캐스트: Complex
+float H = CollisionComp->GetHeight(X, Y, EHeightfieldSource::Complex).GetValue();
+
+// 캐릭터 이동: Simple
+UPhysicalMaterial* Mat = CollisionComp->GetPhysicalMaterial(X, Y, EHeightfieldSource::Simple);
+
+// 에디터 도구가 Visibility 구멍을 반영하려면: Editor
+float EditorH = CollisionComp->GetHeight(X, Y, EHeightfieldSource::Editor).GetValue();
+```
+
+내부적으로:
+```cpp
+switch (Source)
+{
+    case EHeightfieldSource::Simple:  return HeightfieldRef->HeightfieldSimpleGeometry;
+    case EHeightfieldSource::Complex: return HeightfieldRef->HeightfieldGeometry;
+    case EHeightfieldSource::Editor:  return HeightfieldRef->EditorHeightfieldGeometry;
+}
+```
+
+**일반 UE 물리 쿼리 API**(`UWorld::LineTraceSingle` 등)는 이 enum을 직접 받지 않고, 대신 **쿼리 파라미터의 `TraceComplex` 플래그** + 프로젝트 설정의 "Use Complex as Simple"로 간접 선택됩니다:
+- `TraceComplex = false` + 기본 채널 설정 → Simple Heightfield 사용
+- `TraceComplex = true` → Complex Heightfield 사용
+- 이때 내부적으로 위 enum과 매핑됨
+
+즉 enum은 **Landscape 직접 API에서는 파라미터로 노출**되고, **일반 UE 물리 쿼리에서는 Trace 플래그에서 간접 매핑**되는 구조. 외부 게임플레이 코드는 보통 Trace 플래그만 쓰고, enum은 Landscape 내부 분기에만 등장합니다.
+
 ### 2.3 Simple vs Complex 콜리전
 
 UE의 물리 쿼리 채널 설정에 따라 **Simple** 또는 **Complex** 지오메트리가 선택됩니다:
@@ -222,6 +264,8 @@ UE의 물리 쿼리 채널 설정에 따라 **Simple** 또는 **Complex** 지오
 > - `LandscapeHeightfieldCollisionComponent.h:62-70` — 해상도 필드들
 
 ## 3. CollisionQuadFlags — 비트 패킹된 쿼드 속성
+
+> **"쿼드(quad)"란**: 2D 격자의 한 칸 = 4개 정점이 이루는 단위 정사각형. 렌더링 시에는 대각선으로 나뉘어 **삼각형 2개**로 그려집니다. `CollisionSizeQuads = 63`이면 한 컴포넌트의 콜리전 격자가 한 축당 63칸 (= 64개 정점). 콜리전 Heightfield도 이 격자 단위로 Chaos가 교차 테스트를 수행하며, **`CollisionQuadFlags`는 이 각 quad 셀의 8비트 속성**(물리 재질 인덱스 + 대각선 방향 + 구멍 플래그)을 저장합니다. 자세한 quad/subsection 정의는 [04-heightmap-weightmap.md §2.0](04-heightmap-weightmap.md) 참고.
 
 각 collision quad는 8비트 플래그를 가집니다:
 
