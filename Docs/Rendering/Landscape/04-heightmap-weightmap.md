@@ -190,6 +190,39 @@ BatchedMerge에서 **노멀 계산을 위해 3×3 이웃 컴포넌트가 모두 
 
 ## 3. Heightmap 텍스처
 
+### 3.0 Heightmap 텍스처는 무엇과 매핑되는가
+
+**기본 매핑은 1개 `ULandscapeComponent`당 1장의 Heightmap 텍스처**입니다. 즉:
+
+```
+ULandscapeComponent (타일 하나)
+   │ 보유
+   ▼
+HeightmapTexture: TObjectPtr<UTexture2D>     ← 보통 이 컴포넌트 전용 텍스처 한 장
+   │ 채널 구성 (BGRA8)
+   ├── R, G: 16비트 높이값 (R<<8 | G)
+   └── B, A: 노멀 X, Y
+```
+
+크기 매핑 예 (ComponentSizeQuads=63, NumSubsections=2 기본):
+- 컴포넌트 정점 격자: 64×64
+- Heightmap 텍스처 해상도: 64×64 (정점 1개당 텍스처 텍셀 1개 1:1 대응)
+
+**텍스처 공유 케이스 (예외)**: 작은 컴포넌트 여러 개가 한 큰 텍스처를 분할해 공유할 수 있음:
+- 32×32 컴포넌트 4개가 64×64 텍스처 한 장을 4분할 (예: 좌상/우상/좌하/우하)
+- 이때 각 컴포넌트가 `HeightmapScaleBias = (0.5, 0.5, 0.0/0.5, 0.0/0.5)`로 자기 영역 UV 변환
+- 메모리 절약 목적 (작은 컴포넌트가 많을 때 텍스처 헤더 오버헤드 줄임)
+- 일반적인 127×127 같은 큰 컴포넌트에서는 잘 안 쓰임 (1:1 매핑이 보통)
+
+매핑 정보:
+- `ULandscapeComponent::HeightmapTexture` — UPROPERTY 하드 참조
+- `ULandscapeComponent::HeightmapScaleBias: FVector4` — UV 변환 (텍스처 공유 시에만 비자명)
+- 같은 텍스처를 공유하는 다른 컴포넌트들은 `LandscapeProxy::WeightmapUsageMap` 같은 사용량 추적 맵에서 확인
+
+> **소스 확인 위치**
+> - `Engine/Source/Runtime/Landscape/Classes/LandscapeComponent.h:552` — `HeightmapTexture`
+> - `LandscapeComponent.h:478-479` — `HeightmapScaleBias`
+
 ### 3.1 포맷과 패킹
 
 Heightmap은 **32비트 컬러 텍스처(`UTexture2D`, BGRA8)** 한 장에 **16비트 높이 + 노멀 XY**를 함께 패킹합니다.
