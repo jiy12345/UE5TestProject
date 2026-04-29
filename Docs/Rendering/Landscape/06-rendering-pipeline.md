@@ -864,24 +864,28 @@ sequenceDiagram
 ```mermaid
 graph TB
     subgraph Edit["편집 시점"]
+        direction TB
         A[BatchedMerge 완료] --> B[HeightmapTexture 갱신]
         B --> C[CachedLocalBox 재계산]
         C --> D[MarkRenderStateDirty]
         D --> E[다음 프레임: 프록시 재생성 또는 파라미터 업데이트]
     end
-    
+
+    E -.편집 결과가 다음 프레임 렌더에 반영.-> F
+
     subgraph Frame["매 프레임 렌더"]
+        direction TB
         F[프록시 가시성 체크<br/>CachedLocalBox vs Frustum] --> G{bNaniteActive?}
         G -->|No| H[Classic Path]
         G -->|Yes| I[Nanite Path]
-        
+
         H --> J[FLandscapeRenderSystem<br/>인접 프록시와 LOD 조정]
         J --> K[LODScreenRatioSquared에서<br/>연속 LOD 값 계산]
         K --> L[서브섹션별 batch element 선택]
         L --> M[FLandscapeSharedBuffers로부터<br/>정점/인덱스 버퍼 바인딩]
         M --> N[FLandscapeUniformShaderParameters<br/>+ HeightmapTexture 바인딩]
         N --> O[GPU: VS가 Heightmap 샘플링 → 정점 생성<br/>PS는 Weightmap으로 블렌딩]
-        
+
         I --> P[ULandscapeNaniteComponent의 UStaticMesh]
         P --> Q[Nanite SceneProxy가<br/>표준 Nanite 렌더에 편승]
     end

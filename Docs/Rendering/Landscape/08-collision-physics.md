@@ -25,7 +25,7 @@ Landscape의 **렌더링**과 **물리 충돌**은 **서로 다른 데이터 구
 
 ### 2.0 1:1 짝 관계 — ULandscapeComponent당 콜리전 컴포넌트 하나
 
-**네, 각 `ULandscapeComponent`마다 하나의 `ULandscapeHeightfieldCollisionComponent`가 짝으로 붙습니다.** 1:1 매핑:
+각 `ULandscapeComponent`(렌더용 타일)마다 정확히 하나의 `ULandscapeHeightfieldCollisionComponent`(물리용 타일)가 **1:1 짝**으로 붙습니다. 매핑 구조:
 
 ```
 ALandscapeProxy
