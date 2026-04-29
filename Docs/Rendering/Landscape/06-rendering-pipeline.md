@@ -251,9 +251,9 @@ static LANDSCAPE_API TMap<uint32, FLandscapeSharedBuffers*> SharedBuffersMap;
 
 Landscape LOD의 특징은 **정수가 아닌 연속 실수 LOD**를 쓴다는 점입니다. 각 컴포넌트의 LOD는 "LOD 2.3" 같이 중간값을 가질 수 있고, 셰이더에서 **LOD 2의 정점과 LOD 3의 정점을 보간**해 이음새 없는 전환을 만듭니다 (morphing).
 
-#### 개발자가 LOD를 수동 제어할 수 있는가
+#### LOD 수동 제어 수단
 
-네, 여러 단계에서 가능합니다:
+자동 LOD가 기본이지만 **개발자가 여러 단계에서 수동 제어**할 수 있습니다:
 
 | 레벨 | 방법 | 효과 |
 |------|------|------|

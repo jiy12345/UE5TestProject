@@ -54,9 +54,9 @@ Landscape는 LOD를 **정수 단계가 아니라 실수값**으로 가집니다.
 
 거리가 LOD 경계를 지날 때 **정점 수가 갑자기 변하지 않고** 정점이 서서히 녹아들어 옆 정점과 합쳐집니다. 사용자 눈에는 "LOD가 바뀌었다"는 pop이 보이지 않습니다. 상세 구현은 [06-rendering-pipeline.md §2.4](06-rendering-pipeline.md) 참고.
 
-#### "LOD blend range"는 수정 가능한 값인가
+#### LOD blend range 튜닝 — 수정 가능한 값과 경험적 조정
 
-네, **수정 가능합니다.** 그리고 최적값은 콘텐츠와 환경에 따라 달라지므로 **경험적으로 조정**합니다.
+`LOD blend range`는 **수정 가능한 프로퍼티**이며, 최적값은 콘텐츠·플랫폼에 따라 달라져 **경험적으로 조정**합니다.
 
 - **노출**: `ALandscapeProxy::LODBlendRange` 프로퍼티 (Details 패널, 또는 마스터에서 설정 후 프록시로 전파)
 - **셰이더 측**: `InvLODBlendRange = 1.0f / LODBlendRange`로 변환되어 `FLandscapeUniformShaderParameters`에 들어감
