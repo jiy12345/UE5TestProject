@@ -43,8 +43,112 @@
 
 모든 단계가 끝난 후:
 1. 빌드/검증 (UHT, UBT 등)
-2. 커밋, PR 생성
-3. PIE 등 사용자 검증이 필요한 항목은 **체크리스트로 남기고 사용자에게 위임**
+2. **인사이트 정리** (아래 §인사이트 저장 정책 참조)
+3. 커밋, PR 생성
+4. PIE 등 사용자 검증이 필요한 항목은 **체크리스트로 남기고 사용자에게 위임**
+
+## 인사이트 저장 정책
+
+구현 중 얻은 인사이트는 4가지 분류로 나누어 적절한 위치에 저장합니다.
+
+### 분류 → 저장 위치
+
+| 인사이트 유형 | 저장 위치 | 형식 |
+|---|---|---|
+| **실무 인사이트 (모듈 무관 범용)** — DrawDebug, Build.cs 패턴, UPROPERTY 메타 등 | `Docs/Practical/<Topic>.md` (최상위) | 4섹션 템플릿 |
+| **실무 인사이트 (특정 모듈 한정)** — `FPathFindingQuery`, `ProjectPointToNavigation` 등 | `Docs/Practical/<ModuleName>/<Topic>.md` | 4섹션 템플릿 |
+| **개념 보완** — API 동작 원리, 자료구조 의미, 엔진 내부 메커니즘 | 기존 분석 문서 (`Docs/AI/...`, `Docs/MVVM/...`)에 인라인 보완 | 해당 문서 흐름 따라감 |
+| **설계 결정 근거** — "왜 이 설계를 골랐나" | PR 본문 / 커밋 메시지 | 자유 |
+| **코드 함정** — 코드 읽을 때 반드시 알아야 할 것 | 해당 라인에 한 줄 주석 (최소화 원칙 유지) | 1줄 |
+
+### `Docs/Practical/` 디렉토리 구조
+
+```
+Docs/Practical/
+├── README.md                          # 전체 인덱스
+├── DebugVisualization.md              # 범용: DrawDebug 패턴
+├── BuildAndModule.md                  # 범용: Build.cs 의존성, ModuleRules
+├── NavigationSystem/                  # ← UE 엔진 모듈명 그대로 (PascalCase)
+│   ├── README.md
+│   ├── PathQuery.md
+│   ├── NavMeshProjection.md
+│   └── ...
+├── Engine/
+└── ModelViewViewModel/
+```
+
+**모듈명 규칙**: `Engine/Source/Runtime/<ModuleName>/` 또는 플러그인 모듈의 `<ModuleName>` **그대로 PascalCase**. Build.cs에 들어가는 문자열과 1:1 매칭.
+
+| 폴더 | 엔진 경로 |
+|---|---|
+| `NavigationSystem/` | `Engine/Source/Runtime/NavigationSystem/` |
+| `Engine/` | `Engine/Source/Runtime/Engine/` |
+| `Core/` | `Engine/Source/Runtime/Core/` |
+| `UMG/` | `Engine/Source/Runtime/UMG/` |
+| `ModelViewViewModel/` | `Engine/Plugins/Runtime/ModelViewViewModel/Source/ModelViewViewModel/` |
+
+### 범용 + 모듈 특화가 동시에 해당될 때 (이중 저장)
+
+**원칙**: 범용 부분은 최상위, 모듈 특수 케이스는 모듈 폴더에 한 번 더.
+
+- 최상위 (`Docs/Practical/<Topic>.md`) = 일반 원칙·범용 패턴 (원본)
+- 모듈 폴더 (`Docs/Practical/<ModuleName>/<Topic>.md`) = "이 모듈에서 위 일반 원칙이 어떻게 적용되는가" — **차이점·특수 케이스에만 집중**, 일반 부분은 최상위 링크
+- **같은 코드를 통째로 복붙 X** — 동기화 깨짐. cross-link 필수.
+
+예: `DrawDebug` 일반 노하우는 `Docs/Practical/DebugVisualization.md`, NavMesh 경로/투사 시각화 시 색상·Z오프셋 관습은 `Docs/Practical/NavigationSystem/DebugVisualization.md`.
+
+### 빈 폴더 사전 생성 X
+
+첫 인사이트 추가 시점에 폴더와 README 함께 생성. 빈 자리잡기 X.
+
+### 4섹션 템플릿 (`Docs/Practical/` 모든 .md 공통)
+
+```markdown
+# 주제명
+
+## TL;DR
+- 1줄짜리 핵심 룰 5~10개. "X 할 때는 Y" 형식.
+
+## Recipes (이런 상황엔 이렇게)
+### <상황 1>
+[코드 스니펫 + 주의점]
+
+### <상황 2>
+...
+
+## Pitfalls (함정 — 증상 → 원인)
+### 증상: <관찰 가능한 현상>
+- 원인: <근본 원인>
+- 확인: <어떻게 진단>
+
+## References
+- 출처 이슈/PR: #N
+- 엔진 소스: `Path/To/File.cpp:LINE`
+- 개념 문서: `../../AI/.../XX.md` §섹션
+```
+
+**섹션 헤더에 검색 키워드를 박는다** — `### 증상: 경로가 직선만 나옴` 같은 식. grep "증상:"으로 함정 일람 가능.
+
+### 운영 흐름 (단계별)
+
+각 세부 단계가 끝날 때 Claude가 다음 형식으로 인사이트 후보 제시:
+
+```
+[이번 단계 인사이트 후보]
+1. (실무·범용) DrawDebugSphere segments 트레이드오프 → Docs/Practical/DebugVisualization.md
+2. (실무·모듈) FPathFindingQuery Owner 인자 의미 → Docs/Practical/NavigationSystem/PathQuery.md
+3. (개념) FindPathSync 내부 동작 → Docs/AI/RecastNavMesh/04-source-analysis.md §X 보완
+4. (설계 결정) 왜 Tick 기반 시각화인가 → PR 본문
+5. (코드 함정) NavData NULL 가능 타이밍 → 코드 라인 주석 1줄
+```
+
+사용자 OK / 수정 / 제외 → **3단계(마무리) 시점에 일괄 반영**. 단계마다 즉시 문서 갱신은 X (단계 흐름 끊김 방지).
+
+### 절대 금지
+
+- **인사이트 분류 없이 마무리 단계 진입** — 후보 제시는 매 단계 필수
+- **같은 인사이트를 최상위/모듈 양쪽에 코드 통째 복붙** — cross-link로 처리
+- **이슈 번호별/날짜별 폴더링** (예: `Practical/Issue19/`) — 시간 지나면 못 찾음. 항상 주제별
 
 ## 절대 금지
 
