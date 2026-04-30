@@ -19,7 +19,8 @@ public class UE5TestProject : ModuleRules
 		{
 			"Slate",
 			"SlateCore",
-			"UMG"
+			"UMG",
+			"NavigationSystem"
 		});
 	}
 }
