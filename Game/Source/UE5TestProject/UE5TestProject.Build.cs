@@ -12,7 +12,8 @@ public class UE5TestProject : ModuleRules
 			"CoreUObject",
 			"Engine",
 			"InputCore",
-			"ModelViewViewModel"
+			"ModelViewViewModel",
+			"NavigationSystem"
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[]
