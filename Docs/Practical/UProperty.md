@@ -214,6 +214,81 @@ TStrongObjectPtr<AActor> StrongTarget; // strong: 자동 AddToRoot/RemoveFromRoo
 
 UPROPERTY 없이도 GC와 협력. 일반 멤버는 UPROPERTY로 충분, 특수 케이스에서만.
 
+### Raw Pointer가 사실상 안전한 패턴
+
+**raw `UObject*` = 항상 위험은 아니다**. 위험한 건 **다음 GC pass를 넘어가는 경우**. GC는 60초 간격(기본)으로 동작하므로 짧은 스코프에서는 raw도 실용적으로 안전.
+
+핵심 룰: **누군가 다른 곳에서 keep-alive를 보장하면 raw pointer로 가리켜도 OK.** 다음 4가지 중 하나면 안전:
+
+| keep-alive 메커니즘 | 예시 |
+|---|---|
+| 다른 객체의 UPROPERTY가 들고 있음 (가장 흔함) | 부모 컴포넌트가 우리를 UPROPERTY로 들고 있음 |
+| `AddToRoot()`로 명시적 루트 | 싱글톤 매니저, 임시 보존 |
+| `RF_Standalone` 플래그 | 에셋 (Texture, Material 등) |
+| Outer 체인 | Component의 Outer = Actor → Level → World → 루트 |
+
+#### 안전 패턴 1 — 함수 인자
+
+```cpp
+void DoSomething(AActor* Target)
+{
+    Target->GetActorLocation();
+    // 함수 안에서만 쓰고 끝
+    // → caller가 Target을 살려두고 있다고 가정 (보통 caller의 UPROPERTY)
+}
+```
+
+함수 호출 동안은 안전. 단 **저장 X** — 멤버 변수에 넣으면 위험.
+
+#### 안전 패턴 2 — 같은 함수 내 로컬 변수, 짧은 사용
+
+```cpp
+void Tick(float Delta)
+{
+    AActor* Target = Cast<AActor>(SomeComponent->GetOwner());
+    if (Target) { Target->...; }
+    // 같은 Tick 안에서만 사용
+    // → GC는 게임 스레드에서 동기적 — 같은 함수 안에선 안 끼어듦
+}
+```
+
+#### 안전 패턴 3 — Outer가 살아있다고 보장된 자식
+
+```cpp
+void UMyComp::DoWork()
+{
+    AActor* Owner = GetOwner();   // 우리 컴포넌트의 Outer
+    Owner->...;
+    // 우리가 살아있는 동안 Owner도 살아있음 (Outer 체인 보장)
+}
+```
+
+#### 위험 패턴 — 멤버 변수
+
+```cpp
+class UMyComp
+{
+    AActor* SavedTarget = nullptr;   // 💥 raw 멤버
+
+    void OnSomething(AActor* T) { SavedTarget = T; }
+    void Tick(...) { SavedTarget->...; }   // T가 살아있다는 보장 X — 다음 GC pass에서 dangling 가능
+};
+```
+
+멤버 변수는 **다음 GC pass를 넘어 살아남아야** 하므로 UPROPERTY 필수.
+
+### 사용 결정 표 — raw vs UPROPERTY vs Smart Pointer
+
+| 상황 | 권장 |
+|---|---|
+| **클래스 멤버 변수** (UObject*) | 항상 `UPROPERTY()` |
+| **함수 인자** (단순 전달) | raw `UObject*` OK (caller 보장) |
+| **로컬 변수, 같은 함수 내 짧은 사용** | raw OK |
+| **컨테이너 멤버** (배열/맵) | `UPROPERTY() TArray<UObject*>` (절대 `std::vector` X) |
+| **글로벌/싱글톤** | `TStrongObjectPtr<T>` (자동 AddToRoot) |
+| **Optional / 약한 참조 / 멀티스레드** | `TWeakObjectPtr<T>` (destroy 시 IsValid() = false) |
+| **에셋 핸들 / 디스크 로드 대상** | `TSoftObjectPtr<T>` (지연 로드) |
+
 ## EditAnywhere vs EditDefaultsOnly vs EditInstanceOnly
 
 | 키워드 | CDO 편집 | 인스턴스 편집 | 사용처 |
