@@ -82,25 +82,137 @@ UPROPERTY 한 줄로 다음 5가지가 동시에 결정:
 | **직렬화** | 디폴트로 `.uasset`/SaveGame에 자동 저장. `Transient`로 제외 가능 |
 | **Replication** | `Replicated` 키워드로 네트워크 동기화 등록 |
 
-## 핵심 함정 — UObject 포인터엔 반드시 UPROPERTY
+## UObject 포인터엔 반드시 UPROPERTY — GC 메커니즘과 함께
 
-### 증상: Actor가 destroy됐는데 우리 포인터로 접근 시 크래시
+> **이 섹션은 실무 진입점**. UE GC 시스템의 깊은 분석은 별도 시리즈 [#32](https://github.com/jiy12345/UE5TestProject/issues/32) (예정 — `Docs/GC/`)로 분리. 여기서는 UPROPERTY와 직접 관련된 부분만 정리.
 
+### 핵심 명제
+
+**UE GC = Mark-Sweep (Tracing GC), NOT Reference Counting.**
+
+| 방식 | UE | C++ shared_ptr/Rc |
+|---|---|---|
+| 메커니즘 | 주기적으로 루트에서 그래프 traversal, 도달 안 되는 객체 destroy | 참조 추가/제거 시 카운트 ±1, 0이면 즉시 destroy |
+| 순환 참조 | **자동 처리** (둘 다 unreachable이면 같이 정리) | **누수** (카운트 영원히 ≥1) |
+| 즉시성 | 지연 (다음 GC pass) | 즉시 |
+| 참조 변경 오버헤드 | 0 (평소엔) | atomic increment/decrement |
+
+→ **raw pointer가 위험한 이유는 "ref count에 안 잡혀서 null 됨"이 아니라 "GC traversal에 안 잡혀 객체가 destroy되는데 우리 포인터는 그대로 dangling"**. null이 되는 게 아니라 메모리는 해제되고 포인터는 남는 것.
+
+### UPROPERTY의 두 가지 GC 효과
+
+#### 효과 1 — Reachability (keep-alive)
+
+GC는 mark-sweep:
+1. 루트 셋에서 시작 (월드, GameInstance, RF_Standalone, AddToRoot한 객체)
+2. **각 객체의 UPROPERTY 포인터를 따라가며 reachable 마크**
+3. 한 번 마크된 객체는 **재방문 X** — `MarkAsReachableInterlocked` atomic CAS (`GarbageCollection.cpp:1078-1090`)
+4. 마크 안 된 객체는 destroy
+
+→ **우리가 UPROPERTY로 들고 있으면 GC가 그 객체를 reachable로 본다 = 살려둠**.
+→ raw pointer는 traversal 엣지가 아니라 GC가 못 봄 → 다른 reference 없으면 destroy됨.
+
+#### 효과 2 — 자동 nullptr 클리어
+
+`GarbageCollection.cpp:5390`:
 ```cpp
-// 함정: UPROPERTY 없음
-AActor* TargetActor = SomeWorld->SpawnActor(...);
-// ... 어딘가에서 TargetActor->Destroy() ...
-TargetActor->GetActorLocation();   // 크래시 — TargetActor는 dangling
+*ReferenceInfo.Reference = nullptr;
 ```
 
-- 원인: GC가 `TargetActor`를 추적 안 함. 다른 reference도 없으면 GC가 destroy. 우리 포인터는 그대로 남아 dangling.
-- 확인: 모든 UObject* 멤버에 UPROPERTY 부착했는지 점검. 로컬 변수도 위험할 수 있음 (긴 생명주기면 `TStrongObjectPtr` 또는 `TWeakObjectPtr` 사용).
-- 해결:
-  ```cpp
-  UPROPERTY()
-  AActor* TargetActor = nullptr;
-  ```
-  편집/BP 노출 필요 없으면 키워드 없는 `UPROPERTY()` 만으로 GC 추적 활성화.
+객체가 명시적 destroy되면 다음 GC pass에서 **모든 UPROPERTY 포인터를 자동 nullptr로 클리어**. raw pointer는 그대로.
+
+→ **UPROPERTY 부착 시에만 `if (Target)` null 체크가 신뢰성 있음**. raw pointer는 destroy 후에도 null 안 됨 → if문 통과 후 use-after-free.
+
+### 두 시나리오로 비교
+
+#### 시나리오 1 — 다른 reference 없을 때 GC 동작
+
+```cpp
+// UPROPERTY 없음 (raw)
+AActor* Target = nullptr;
+
+void Init() { Target = GetWorld()->SpawnActor<AActor>(); }
+// 다른 reference 없는 상태로 GC pass...
+// → Target이 가리킨 Actor는 unreachable로 판정 → destroy
+Target->GetActorLocation();  // 💥 use-after-free
+```
+
+```cpp
+// UPROPERTY 있음
+UPROPERTY()
+AActor* Target = nullptr;
+
+void Init() { Target = GetWorld()->SpawnActor<AActor>(); }
+// GC pass... Target이 reachable이라 살아있음
+Target->GetActorLocation();  // ✅
+```
+
+#### 시나리오 2 — 명시적 `Destroy()`
+
+```cpp
+// UPROPERTY 없음
+AActor* Target = ...;
+Target->Destroy();
+if (Target) Target->GetActorLocation();  // 💥 if문 통과 후 dangling 접근
+```
+
+```cpp
+// UPROPERTY 있음
+UPROPERTY()
+AActor* Target = ...;
+Target->Destroy();
+// GC pass에서 Target = nullptr 자동 클리어
+if (Target) Target->GetActorLocation();  // ✅ if문이 정확히 막아줌
+```
+
+### GC 주기와 트리거
+
+- **기본 60s** (`gc.TimeBetweenPurgingPendingKillObjects`, `UnrealEngine.cpp:1682`)
+- 메모리 압박 시 30s (`gc.LowMemoryTimeBetweenPurgingPendingKillObjects`)
+- 명시적 `GEngine->ForceGarbageCollection()` 가능
+- 레벨 전환 시 자동
+- UE 5.x **Incremental GC** — hitch 방지 위해 traversal을 여러 프레임에 분산
+
+### 루트 셋
+
+GC traversal 시작점:
+| 종류 | 설정 |
+|---|---|
+| 명시적 루트 | `Object->AddToRoot()` |
+| `RF_Standalone` 플래그 | `NewObject<>(... RF_Standalone)` (에셋 등) |
+| 내부 매니저 추적 | `GameInstance`, `GEngine`, 활성 `World` |
+| 클러스터 루트 | UE 내부 최적화 (UClass, BP) |
+
+**일반 UObject는 자동 루트 X** — `NewObject<>()`로 만든 객체는 보통 **Outer 체인**(컴포넌트 → Actor → Level → World → 루트)으로 살아남.
+
+`AddToRoot()`는 드물게 사용 (싱글톤 매니저, 임시 보존 등). 대신 `TStrongObjectPtr<T>`가 더 안전 (소멸 시 자동 RemoveFromRoot).
+
+### 함정: STL 컨테이너에 UObject* 금지
+
+```cpp
+// 함정
+std::vector<AActor*> EnemyList;   // GC 추적 X — 컨테이너 안 raw pointer
+EnemyList.push_back(SpawnedActor);
+// GC 후...
+EnemyList[0]->...   // 💥 dangling
+```
+
+해결:
+```cpp
+UPROPERTY()
+TArray<AActor*> EnemyList;   // GC 추적 — TArray 안 모든 포인터를 GC가 따라감
+```
+
+`TArray`/`TMap`/`TSet`은 reflection 시스템과 통합되어 컨테이너 안 UObject 포인터를 GC가 추적. STL `std::vector`는 reflection 모름.
+
+### 긴 생명주기 / 멀티스레드 — Smart Pointer 대안
+
+```cpp
+TWeakObjectPtr<AActor> WeakTarget;     // weak: destroy 시 IsValid() = false
+TStrongObjectPtr<AActor> StrongTarget; // strong: 자동 AddToRoot/RemoveFromRoot
+```
+
+UPROPERTY 없이도 GC와 협력. 일반 멤버는 UPROPERTY로 충분, 특수 케이스에서만.
 
 ## EditAnywhere vs EditDefaultsOnly vs EditInstanceOnly
 
@@ -143,5 +255,14 @@ TargetActor->GetActorLocation();   // 크래시 — TargetActor는 dangling
 ## References
 
 - 출처: #19 NavDebugVisualizer 단계 2
-- 관련: [UClassMetadata.md](UClassMetadata.md), [UEReflection.md](UEReflection.md)
-- 엔진 소스: `Engine/Source/Runtime/CoreUObject/Public/UObject/UnrealType.h` (FProperty), `Engine/Source/Runtime/CoreUObject/Public/UObject/ObjectMacros.h` (UPROPERTY 매크로 정의)
+- **깊은 분석 (예정)**:
+  - [#32 UE Garbage Collector 분석 시리즈](https://github.com/jiy12345/UE5TestProject/issues/32) — Mark-Sweep 메커니즘, 루트 셋, Incremental GC 등 깊이 다룸. 시리즈 완성 후 `Docs/GC/`로 cross-link
+  - [#31 UE Reflection 시스템 분석 시리즈](https://github.com/jiy12345/UE5TestProject/issues/31) — UPROPERTY 메타 등록 메커니즘 (GC와 직접 연결)
+- 관련 실무 문서: [UClassMetadata.md](UClassMetadata.md), [UEReflection.md](UEReflection.md)
+- 엔진 소스:
+  - `Engine/Source/Runtime/CoreUObject/Public/UObject/UnrealType.h` — FProperty
+  - `Engine/Source/Runtime/CoreUObject/Public/UObject/ObjectMacros.h` — UPROPERTY 매크로 정의
+  - `Engine/Source/Runtime/CoreUObject/Public/UObject/UObjectBaseUtility.h:206` — `AddToRoot` / `RemoveFromRoot`
+  - `Engine/Source/Runtime/CoreUObject/Private/UObject/GarbageCollection.cpp:1078-1090` — Reachability 마크 (재방문 방지)
+  - `Engine/Source/Runtime/CoreUObject/Private/UObject/GarbageCollection.cpp:5390` — UPROPERTY 자동 nullptr 클리어
+  - `Engine/Source/Runtime/Engine/Private/UnrealEngine.cpp:1682` — GC 주기 (`gc.TimeBetweenPurgingPendingKillObjects`)
