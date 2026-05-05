@@ -39,9 +39,13 @@ UE 모듈별 실무 노하우 / 함정 / 레시피. 개념 분석은 `Docs/AI/`,
 
 - [BuildAndModule.md](BuildAndModule.md) — `Build.cs`, `PublicDependencyModuleNames` vs `PrivateDependencyModuleNames`, Unity Build, PCH
 - [UEModuleSystem.md](UEModuleSystem.md) — UE 모듈 시스템이 존재하는 이유 (큰 그림)
+- [UClassMetadata.md](UClassMetadata.md) — `UCLASS(...)` 키워드 / `meta=(...)` 매트릭스
+- [UProperty.md](UProperty.md) — `UPROPERTY(...)` 키워드 / 5가지 효과 / GC 추적 함정
+- [UEReflection.md](UEReflection.md) — UE Reflection 실무 진입점 (깊은 분석은 `Docs/Reflection/` 시리즈 — #31)
 
 ## 모듈별
 
+- [Engine/](Engine/) — Actor/Component/World 등 게임 프레임워크 베이스
 - [NavigationSystem/](NavigationSystem/) — 경로 쿼리, NavMesh 투사, NavModifier, NavData
 
 ## 검색 팁
