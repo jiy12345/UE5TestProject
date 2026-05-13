@@ -122,6 +122,126 @@ if (UStaticMeshComponent* Mesh = Cast<UStaticMeshComponent>(Comp)) { ... }
 | **Hot Reload / Live Coding** | 새 DLL의 UClass와 기존 인스턴스를 reflection으로 매칭. 새 멤버 추가/타입 변경을 런타임에 마이그레이션 |
 | **에디터에서 새 BP 클래스 생성** | 사용자가 부모 클래스 선택 → UClass 정보만으로 새 BP UClass 파생 (인스턴스 없음) |
 
+### 왜 런타임 코드만으론 안 되는가 — C++의 한계
+
+> "런타임에 일어나는 일이면 런타임 코드로 처리하면 되는 것 아닌가?"
+>
+> 런타임 코드가 동작하려면 **컴파일 시점에 알려진 정보가 런타임까지 보존**되어야 한다. C++는 그 정보를 컴파일 후 대부분 버린다 — zero-overhead 철학. Reflection이 정확히 그 정보 보존을 담당.
+
+#### C++의 Zero-overhead 철학과 타입 정보 소실
+
+C++ 컴파일러는 타입을 모두 검증한 후, 메모리 오프셋과 기계어로 변환. 변환 후엔:
+- 객체에 멤버 이름/타입 정보 X — 그냥 메모리 블록
+- 함수에 이름 정보 X — 그냥 메모리 주소
+- 클래스 이름/부모 정보 거의 X — RTTI 켜도 매우 제한적
+- 결과: **객체가 자기 자신을 묘사할 수 없다** (no self-description)
+
+이 한계가 reflection이 필요한 근본 이유.
+
+#### 어떤 타입 정보가 어디에 쓰이나
+
+| 타입 정보 | C++ 컴파일 후 보존? | 누가 런타임에 필요로 하나 |
+|---|---|---|
+| **멤버 이름** (`"Health"`) | ❌ 사라짐 | SaveGame 로드 (`"Health": 100` 매칭), BP 디테일 패널, `FindPropertyByName` |
+| **멤버 오프셋** (객체 시작 + 24 등) | ❌ 사라짐 (인스트럭션에 박힘) | GC traversal (어디부터 어디까지 UObject\*인지), 직렬화, BP 변수 Get/Set |
+| **멤버 타입** (`int32`, `AActor*`, `FString`) | ❌ 사라짐 | 직렬화 (타입별 저장 형식), BP 변수 위젯, Replication 비교 |
+| **클래스 이름** (`"AMyEnemy"`) | ❌ 사라짐 (포인터만) | SaveGame 로드, BP 클래스 lookup, `NewObject(UClass*)` |
+| **부모 클래스 정보** | △ RTTI에 부분 (게임은 RTTI off) | `Cast<T>`, `IsA`, BP 변수 타입 호환성 검사 |
+| **함수 이름** (`"Attack"`) | ❌ 사라짐 (메모리 주소만) | 콘솔 명령, BP 함수 호출 노드, RPC dispatch |
+| **함수 시그니처** (인자 개수/타입) | ❌ 사라짐 | BP 호출 코드 생성, RPC 인자 (역)직렬화, `ProcessEvent` |
+
+#### 구체 시나리오
+
+**SaveGame 로드 — 멤버 이름 + 오프셋 + 타입 셋 다 필요**
+
+```
+파일: { "Health": 100, "Name": "Hero" }
+       ↓
+1. "Health" 문자열 → FProperty 찾기 (멤버 이름 필요)
+2. FProperty에서 오프셋(+24) + 타입(int32) 얻기
+3. obj 주소 + 24에 int32 값 100 쓰기
+```
+
+→ Reflection 없으면 1번에서 막힘. 컴파일 후 `"Health"`라는 문자열은 코드 어디에도 없음.
+
+**GC — 멤버 오프셋 + 타입(UObject 포인터인지) 필요**
+
+```
+객체 A 메모리: [vtable][int32 Health][AActor* Target][float Speed]
+                       +8           +24             +32
+       ↓
+GC가 "+24 위치는 UObject*"라는 걸 알아야 → 그 포인터 따라 traversal
+```
+
+→ Reflection 없으면 어느 오프셋이 UObject\* 멤버인지 모름.
+
+**Cast<T> — 클래스 이름 + 부모 정보 필요**
+
+```cpp
+USceneComponent* Comp = ...;   // 실제 타입은 UStaticMeshComponent
+if (Cast<UStaticMeshComponent>(Comp)) { ... }
+       ↓
+Comp의 UClass 얻기 → UClass의 부모 트리 traversal → UStaticMeshComponent 매칭 확인
+```
+
+→ 컴파일러는 캐스트 코드만 생성하고 부모 트리 정보를 객체에 안 박음. `dynamic_cast`로 대체 가능하나 더 무겁고 BP와 통합 X.
+
+#### 카테고리별 "런타임 코드만으론 왜 안 되나"
+
+**카테고리 1 (string-based lookup)** — 분리 컴파일 / 모듈 결합도
+```cpp
+// reflection 없이 콘솔 처리:
+void HandleCmd(FString Cmd) {
+    if (Cmd == "DebugAI") DebugAI();
+    else if (Cmd == "SpawnEnemy") SpawnEnemy();
+    // ... 매번 수정
+}
+```
+- 콘솔은 **엔진** 코드. 우리 게임 함수를 컴파일 시점에 모름
+- 새 함수 추가 → 엔진 if-else 수정? 불가능
+- → Reflection: 각 함수가 자기 자신을 등록 (self-description), 엔진은 lookup만
+
+**카테고리 2 (객체 그래프 순회, GC)** — 멤버 정보 소실
+```cpp
+// reflection 없이 GC:
+void MarkReachable(UObject* obj) {
+    obj->???   // 멤버 목록을 어떻게 얻지?
+}
+```
+- 컴파일 후 객체는 그냥 바이트 덩어리 — 멤버 위치/타입 정보 X
+- 대안: 모든 UObject 자식이 `virtual AddReferencedObjects()` 직접 구현? → 1000개 클래스 = 1000개 함수, 실수 한 번에 GC 누수
+- → Reflection: UPROPERTY가 멤버 테이블 자동 생성
+
+**카테고리 3 (Cast<T>)** — RTTI 제한 + BP 통합 어려움
+- `dynamic_cast` 가능하지만 무겁고 (UE는 RTTI off), 멤버/함수 메타 없음
+- BP가 "이 객체가 우리 C++ 타입인가?" 검사 — BP 컴파일러가 C++ typeinfo 접근 어려움
+- → Reflection: UClass가 자기 자신을 묘사, BP/에디터와 통일된 인터페이스
+
+**카테고리 4 (NewObject by name)** — 컴파일 시점에 존재 안 함
+```cpp
+// reflection 없이:
+UObject* CreateByName(FString Cls) {
+    if (Cls == "AMyEnemy") return new AMyEnemy();
+    // ... 그러나 BP 클래스는 컴파일 시점에 존재도 안 함!
+}
+```
+- BP 클래스는 디스크에서 로드, 런타임에 새 UClass 생성
+- 우리 C++ 코드는 BP 클래스명을 미리 알 길이 없음 → if-else 자체 불가능
+- → Reflection: UClass\*를 1급 객체로, 디스크 로드한 BP도 같은 인터페이스로 인스턴스 생성
+
+#### 다른 언어와 비교 — 왜 C++만 이런 게 필요한가
+
+| 언어 | 타입 정보 보존 | Reflection 비용 |
+|---|---|---|
+| **C/C++** | 컴파일 후 거의 다 버림. **Zero-overhead 철학** | 매크로 + 코드 생성으로 직접 구현 필요 (UE의 UHT 시스템) |
+| **Java / C#** | 처음부터 바이트코드/IL에 풀 보존 | 언어 기본 기능 — 그냥 됨 |
+| **Python / JS** | 동적 타입 — 객체가 자기 클래스 정보 항상 들고 다님 | 언어 기본 기능 — 그냥 됨 |
+| **Rust** | C++와 유사. zero-cost | `Any` trait + 매크로(serde 등)로 일부 보완 |
+
+→ Java로 게임 엔진을 만들면 reflection은 그냥 됨. C++로 만들면 **매크로 + UHT라는 거대한 메커니즘**으로 reflection을 직접 구현해야 함. UE5의 UCLASS/UPROPERTY 시스템이 정확히 그것.
+
+→ 이게 "**왜 Unity(C#)는 별도 reflection 시스템이 없는데 UE는 거대한 매크로 시스템을 가지나**"의 답.
+
 ### C++26 정적 reflection과의 비교
 
 C++26에 컴파일 시점 reflection 도입 예정 — 정적 멤버 순회 등 매크로 boilerplate 제거 가치는 큼.
