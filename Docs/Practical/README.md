@@ -42,6 +42,7 @@ UE 모듈별 실무 노하우 / 함정 / 레시피. 개념 분석은 `Docs/AI/`,
 - [UClassMetadata.md](UClassMetadata.md) — `UCLASS(...)` 키워드 / `meta=(...)` 매트릭스
 - [UProperty.md](UProperty.md) — `UPROPERTY(...)` 키워드 / 5가지 효과 / GC 추적 함정
 - [UEReflection.md](UEReflection.md) — UE Reflection 실무 진입점 (깊은 분석은 `Docs/Reflection/` 시리즈 — #31)
+- [DebugVisualization.md](DebugVisualization.md) — DrawDebug, AddOnScreenDebugMessage 패턴 / z-fighting / Key 슬롯 / 색상 관습
 
 ## 모듈별
 

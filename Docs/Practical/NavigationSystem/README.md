@@ -34,9 +34,9 @@ PrivateDependencyModuleNames.AddRange(new[] { "NavigationSystem" });
 
 자세한 룰은 [`../BuildAndModule.md`](../BuildAndModule.md) `#include` 위치와 Build.cs Public/Private 짝짓기 참고.
 
-## 주제별 문서 (예정)
+## 주제별 문서
 
-- (TBD) `PathQuery.md` — 경로 쿼리 (`FindPathSync`, `FPathFindingQuery`)
+- [PathQuery.md](PathQuery.md) — 경로 쿼리 (`FindPathSync`/`FindPathAsync`, `FPathFindingQuery`, `FPathFindingResult`, `FNavPathSharedPtr`)
 - (TBD) `NavMeshProjection.md` — 위치 → NavMesh 투사 (`ProjectPointToNavigation`)
 - (TBD) `NavModifier.md` — `NavModifierVolume`, `NavArea`, `DynamicModifiersOnly`
 
