@@ -17,16 +17,34 @@ UE5 에디터에서 실행하는 자동화 스크립트 모음.
 
 NavDebug 검증용 테스트 맵 자동 생성 (`/Game/Test/NavDebugTest`).
 
-**실행 방법**:
+**실행 방법 (UE 5.x 권장 순)**:
 
-**옵션 A — Python 콘솔에서**:
-```python
-exec(open(r"<프로젝트 절대 경로>/Game/Scripts/setup_nav_debug_test_map.py").read())
+**옵션 A — `py` 콘솔 명령 (가장 쉬움)**:
+
+Output Log 콘솔 입력란에 그대로 입력 (입력 모드 `Cmd` 그대로):
+
+```
+py "C:/Users/jiy12/Projects/UE5TestProject/Game/Scripts/setup_nav_debug_test_map.py"
 ```
 
-예: `exec(open(r"C:/Users/jiy12/Projects/UE5TestProject/Game/Scripts/setup_nav_debug_test_map.py").read())`
+(따옴표 포함, 슬래시·역슬래시 둘 다 OK)
 
-**옵션 B — 명령행 (헤드리스)**:
+**옵션 B — `Tools` 메뉴**:
+
+에디터 메뉴 `Tools > Execute Python Script` → 파일 다이얼로그에서 `Game/Scripts/setup_nav_debug_test_map.py` 선택.
+
+**옵션 C — Python 콘솔 모드로 변경 후 직접 실행**:
+
+Output Log 패널 콘솔 입력란의 **왼쪽 드롭다운**에서 `Cmd` → `Python` 변경 → 그 후 다음 입력:
+
+```python
+exec(open(r"C:/Users/jiy12/Projects/UE5TestProject/Game/Scripts/setup_nav_debug_test_map.py").read())
+```
+
+(주의: `Cmd` 모드에서 `exec(...)`는 deprecated. 반드시 `Python` 모드로 변경 후 실행)
+
+**옵션 D — 명령행 (헤드리스, 자동화)**:
+
 ```bash
 "<Engine 경로>/Engine/Binaries/Win64/UnrealEditor-Cmd.exe" \
   "<프로젝트 경로>/Game/UE5TestProject.uproject" \
