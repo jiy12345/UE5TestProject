@@ -31,6 +31,7 @@ import unreal
 # ---------- 설정 ----------
 MAP_PATH = "/Game/Test/NavDebugTest"
 NAV_DEBUG_COMPONENT_CLASS = "UNavDebugVisualizerComponent"
+GAME_MODE_CLASS_PATH = "/Script/UE5TestProject.UE5TestProjectGameMode"
 
 FLOOR_LOCATION = unreal.Vector(0, 0, 0)
 FLOOR_SCALE = unreal.Vector(20, 20, 1)  # 200x200 cm * scale = 2000x2000 cm
@@ -186,6 +187,45 @@ def setup_player_start():
     return spawn_actor(unreal.PlayerStart, PLAYER_START_LOCATION, "PlayerStart")
 
 
+def setup_world_game_mode_override():
+    """World Settings의 GameMode Override를 AUE5TestProjectGameMode로 설정."""
+    log("Setting World Settings GameMode Override")
+    level_subsystem = get_level_editor_subsystem()
+    if level_subsystem is None:
+        log("  LevelEditorSubsystem 없음 — World Settings 설정 스킵")
+        return
+
+    world = level_subsystem.get_editor_world() if hasattr(level_subsystem, "get_editor_world") \
+        else unreal.EditorLevelLibrary.get_editor_world()
+    if world is None:
+        log("  Editor World 없음 — 스킵")
+        return
+
+    world_settings = world.get_world_settings()
+    gm_class = unreal.load_class(None, GAME_MODE_CLASS_PATH)
+    if gm_class is None:
+        log("  AUE5TestProjectGameMode 클래스 로드 실패 — 게임 모듈 빌드 확인 필요")
+        return
+
+    world_settings.set_editor_property("default_game_mode", gm_class)
+    log("  World Settings GameMode Override = AUE5TestProjectGameMode")
+
+
+def setup_project_game_default_map():
+    """Project Settings의 GameDefaultMap을 우리 맵으로. 게임 빌드 실행 시 자동 로드."""
+    log("Setting Project Settings GameDefaultMap")
+    try:
+        settings = unreal.GameMapsSettings.get_default_object()
+        map_soft_path = unreal.SoftObjectPath(MAP_PATH)
+        settings.set_editor_property("game_default_map", map_soft_path)
+        # 영구 저장 (DefaultEngine.ini에 기록)
+        settings.save_config()
+        log("  GameDefaultMap = {}".format(MAP_PATH))
+    except Exception as e:
+        log("  GameDefaultMap 설정 실패 (UE 버전 API 차이 가능): {}".format(e))
+        log("  수동 설정: Project Settings > Maps & Modes > Game Default Map = NavDebugTest")
+
+
 def save_level():
     log("Saving level")
     level_subsystem = get_level_editor_subsystem()
@@ -210,6 +250,8 @@ def main():
     path_start, path_end = setup_path_actors()
     setup_nav_debug_actor(path_start, path_end)
     setup_player_start()
+    setup_world_game_mode_override()
+    setup_project_game_default_map()
 
     saved = save_level()
     if saved:
