@@ -1,28 +1,28 @@
 """
 NavDebug 검증용 테스트 맵 자동 생성 스크립트.
 
+캐릭터가 NavMesh 위를 걸어다닐 수 있는 미니멀 환경만 셋업한다.
+NavDebugVisualizerComponent 자체의 사용 wrapper는 #19에서 추가 예정.
+
 사용 방법:
     1. UE5 에디터에서 UE5TestProject 열기
     2. Edit > Plugins에서 "Python Editor Script Plugin" 활성화 (재시작 필요할 수 있음)
-    3. Window > Output Log 패널 → 콘솔 입력 모드 "Python" 선택
-    4. 다음 명령 실행:
-         exec(open(r"<프로젝트 경로>/Game/Scripts/setup_nav_debug_test_map.py").read())
-       또는 Tools > Execute Python Script 메뉴에서 파일 선택
-    5. 자동으로 /Game/Test/NavDebugTest 맵 생성 + 저장됨
+    3. 실행 (옵션 중 하나):
+       - Output Log 콘솔에 `py "C:/.../Game/Scripts/setup_nav_debug_test_map.py"`
+       - 또는 메뉴 Tools > Execute Python Script
+    4. 자동으로 /Game/Test/NavDebugTest 맵 생성 + 저장됨
 
 결과 맵:
-    - Floor: 2000x2000 평면 (Engine/BasicShapes/Floor)
-    - Wall: 장애물 2개 (경로 우회 검증용)
+    - Floor: 2000x2000 평면
+    - Wall: 장애물 2개
     - NavMeshBoundsVolume: floor 영역 덮음 (NavMesh 빌드 영역)
-    - PathStart, PathEnd: 빈 Actor 2개 (NavDebug 컴포넌트가 참조)
-    - NavDebugActor: AActor + UNavDebugVisualizerComponent (PathStart/End 할당 + bEnabled)
-    - PlayerStart: PIE 시작 카메라
+    - PlayerStart: PIE 시작 위치
+    - 조명: DirectionalLight + SkyLight + SkyAtmosphere + ExponentialHeightFog
+    - World Settings GameMode Override = AUE5TestProjectGameMode
+    - Project GameDefaultMap = 이 맵
 
-검증:
-    PIE 실행 시 NavDebugActor의 컴포넌트가 매 프레임 경로를 시각화한다.
-    - 초록 선 + 노란 구체: 정상 경로
-    - PathEnd를 NavMesh 밖으로 옮기면: 빨간 선 + "PATH NOT FOUND"
-    - Wall 사이로 PathStart/End 위치 조정 시 우회 경로 확인
+PIE 실행 시 AUE5TestProjectCharacter가 PlayerStart에 spawn,
+WASD로 NavMesh 위를 걸어다닐 수 있음. 장애물(Wall)에 막히는지 확인.
 """
 
 import unreal
@@ -30,7 +30,6 @@ import unreal
 
 # ---------- 설정 ----------
 MAP_PATH = "/Game/Test/NavDebugTest"
-NAV_DEBUG_COMPONENT_CLASS = "UNavDebugVisualizerComponent"
 GAME_MODE_CLASS_PATH = "/Script/UE5TestProject.UE5TestProjectGameMode"
 
 FLOOR_LOCATION = unreal.Vector(0, 0, 0)
@@ -43,12 +42,7 @@ WALL_SCALE = unreal.Vector(0.5, 5, 1)  # 50x500x100 cm
 NAV_BOUNDS_LOCATION = unreal.Vector(0, 0, 100)
 NAV_BOUNDS_SCALE = unreal.Vector(22, 22, 4)  # NavMesh 빌드 영역 (floor보다 조금 크게)
 
-PATH_START_LOCATION = unreal.Vector(-800, 0, 50)
-PATH_END_LOCATION = unreal.Vector(800, 0, 50)
-
-NAV_DEBUG_ACTOR_LOCATION = unreal.Vector(0, 0, 200)
-
-PLAYER_START_LOCATION = unreal.Vector(-1000, -1000, 200)
+PLAYER_START_LOCATION = unreal.Vector(-800, 0, 200)
 
 
 # ---------- 유틸 ----------
@@ -104,23 +98,102 @@ def spawn_static_mesh(mesh_path, location, scale, label):
     return actor
 
 
-def load_class(class_name):
-    """UClass를 이름으로 로드. UNavDebugVisualizerComponent 같이 게임 모듈 클래스 찾기."""
-    return unreal.load_class(None, "/Script/UE5TestProject.{}".format(class_name))
+def load_class(class_name, module_name="UE5TestProject"):
+    """UClass를 다양한 방법으로 로드 시도 — UE Python API가 환경마다 다름."""
+    full_path = "/Script/{}.{}".format(module_name, class_name)
+
+    # 1. unreal 네임스페이스 직접 접근 (게임 모듈 클래스도 Python에 자동 등록되는 경우 있음)
+    cls = getattr(unreal, class_name, None)
+    if cls is not None:
+        log("  load_class: getattr(unreal, '{}') 성공".format(class_name))
+        return cls
+
+    # 2. load_class — UClass 로드 (가장 정통적이지만 환경 따라 실패)
+    try:
+        cls = unreal.load_class(None, full_path)
+        if cls is not None:
+            log("  load_class: unreal.load_class('{}') 성공".format(full_path))
+            return cls
+    except Exception as e:
+        log("  load_class 시도 실패: {}".format(e))
+
+    # 3. load_object — UClass도 UObject이므로 load_object로 가능
+    try:
+        obj = unreal.load_object(None, full_path)
+        if obj is not None:
+            log("  load_class: unreal.load_object('{}') 성공".format(full_path))
+            return obj
+    except Exception as e:
+        log("  load_object 시도 실패: {}".format(e))
+
+    # 4. find_class — 짧은 이름으로 native UClass 검색
+    try:
+        cls = unreal.find_class(class_name)
+        if cls is not None:
+            log("  load_class: unreal.find_class('{}') 성공".format(class_name))
+            return cls
+    except Exception as e:
+        log("  find_class 시도 실패: {}".format(e))
+
+    log("  load_class 전체 실패: {} (모듈 미로드 또는 reflection 등록 안 됨)".format(full_path))
+    return None
 
 
 # ---------- 맵 생성 ----------
+def clear_user_actors():
+    """현재 레벨의 사용자 actor 모두 삭제 (WorldSettings, Brush 등 system actor는 제외)."""
+    actor_subsystem = get_editor_actor_subsystem()
+    if actor_subsystem is None:
+        log("  EditorActorSubsystem 없음 — actor 정리 스킵")
+        return
+
+    all_actors = actor_subsystem.get_all_level_actors() if hasattr(actor_subsystem, "get_all_level_actors") \
+        else unreal.EditorLevelLibrary.get_all_level_actors()
+
+    # 보존할 system actor 클래스 이름
+    keep_classes = ("WorldSettings", "Brush", "AbstractNavData", "WorldDataLayers", "LevelInstance",
+                    "WorldPartitionVolume", "DefaultPhysicsVolume")
+
+    removed = 0
+    for actor in all_actors:
+        if actor is None:
+            continue
+        cls_name = actor.get_class().get_name()
+        if cls_name in keep_classes:
+            continue
+        try:
+            if hasattr(actor_subsystem, "destroy_actor"):
+                actor_subsystem.destroy_actor(actor)
+            else:
+                unreal.EditorLevelLibrary.destroy_actor(actor)
+            removed += 1
+        except Exception:
+            pass
+
+    log("  기존 actor {}개 삭제".format(removed))
+
+
 def create_new_level():
-    """빈 레벨 새로 생성 + 지정 경로로 저장."""
+    """레벨 준비: 기존 맵이 있으면 load + actor 정리, 없으면 new_level."""
     level_subsystem = get_level_editor_subsystem()
     if level_subsystem is None:
         log("LevelEditorSubsystem 없음 — UE 버전 호환 안 됨")
         return False
 
-    log("Creating new level at {}".format(MAP_PATH))
+    if unreal.EditorAssetLibrary.does_asset_exist(MAP_PATH):
+        log("기존 맵 발견: load 후 actor 정리")
+        loaded = level_subsystem.load_level(MAP_PATH) if hasattr(level_subsystem, "load_level") \
+            else unreal.EditorLevelLibrary.load_level(MAP_PATH)
+        if not loaded:
+            log("  load_level 실패 — 수동 삭제 필요: Content Browser에서 NavDebugTest 우클릭 → Delete")
+            return False
+        clear_user_actors()
+        return True
+
+    log("기존 맵 없음 — Creating new level at {}".format(MAP_PATH))
     success = level_subsystem.new_level(MAP_PATH)
     if not success:
-        log("Failed to create new level — 경로 충돌 또는 권한 문제")
+        log("Failed to create new level — 권한 또는 잔여 상태 문제. 에디터 재시작 후 재시도.")
         return False
     return True
 
@@ -148,55 +221,122 @@ def setup_nav_mesh_bounds():
     return actor
 
 
-def setup_path_actors():
-    log("Spawning PathStart and PathEnd (empty Actors)")
-    start = spawn_actor(unreal.Actor, PATH_START_LOCATION, "PathStart")
-    end = spawn_actor(unreal.Actor, PATH_END_LOCATION, "PathEnd")
-    return start, end
-
-
-def setup_nav_debug_actor(path_start, path_end):
-    log("Spawning NavDebugActor + attaching UNavDebugVisualizerComponent")
-    actor = spawn_actor(unreal.Actor, NAV_DEBUG_ACTOR_LOCATION, "NavDebugActor")
-    if actor is None:
-        return None
-
-    comp_class = load_class(NAV_DEBUG_COMPONENT_CLASS)
-    if comp_class is None:
-        log("Failed to load class: {}. 컴포넌트 부착은 사용자가 에디터에서 수동으로 추가 필요.".format(
-            NAV_DEBUG_COMPONENT_CLASS))
-        return actor
-
-    # 런타임 컴포넌트 추가 (에디터에서 영구 저장됨)
-    comp = actor.add_component_by_class(comp_class, False, unreal.Transform(), False)
-    if comp is None:
-        log("Failed to add component. 사용자가 에디터에서 수동으로 추가 필요.")
-        return actor
-
-    # UPROPERTY 설정
-    comp.set_editor_property("PathStart", path_start)
-    comp.set_editor_property("PathEnd", path_end)
-    comp.set_editor_property("bEnabled", True)
-    comp.set_editor_property("PathLineThickness", 5.0)
-
-    return actor
-
-
 def setup_player_start():
     log("Spawning PlayerStart")
     return spawn_actor(unreal.PlayerStart, PLAYER_START_LOCATION, "PlayerStart")
 
 
+def _set_mobility(actor, mobility):
+    """Actor의 root component mobility를 변경. actor.set_mobility 우선, 실패 시 component 직접."""
+    try:
+        if hasattr(actor, "set_mobility"):
+            actor.set_mobility(mobility)
+            return
+    except Exception:
+        pass
+    try:
+        root = actor.root_component
+        if root is not None:
+            root.set_mobility(mobility)
+    except Exception:
+        pass
+
+
+def setup_lighting():
+    """환경광만 셋업 — NavDebug 검증엔 정교한 lighting 불필요.
+    SkyLight (Movable, 모든 방향 균일) + PostProcessVolume (Auto Exposure 끔, 노출 고정)."""
+    log("Spawning ambient lighting (SkyLight + PostProcessVolume)")
+
+    # SkyLight — 환경광. Lower Hemisphere도 어둡지 않게 → 모든 방향 균일
+    sky_light = spawn_actor(unreal.SkyLight, unreal.Vector(0, 0, 500), "SkyLight")
+    if sky_light is not None:
+        _set_mobility(sky_light, unreal.ComponentMobility.MOVABLE)
+        try:
+            sky_comp = sky_light.get_component_by_class(unreal.SkyLightComponent)
+            if sky_comp is not None:
+                # SLS_SpecifiedCubemap: cubemap 미지정이라도 디폴트 회색 환경광 제공.
+                # SkyAtmosphere 의존 없음 (DirectionalLight 미사용 환경에 적합).
+                try:
+                    sky_comp.set_editor_property("source_type",
+                        unreal.SkyLightSourceType.SLS_SPECIFIED_CUBEMAP)
+                except Exception:
+                    pass
+                # 아래 반구도 회색으로 채워서 위/아래 균일 밝기
+                for attr in ("lower_hemisphere_is_black",):
+                    try:
+                        sky_comp.set_editor_property(attr, False)
+                    except Exception:
+                        pass
+                sky_comp.set_editor_property("intensity", 3.0)
+        except Exception as e:
+            log("  SkyLight 속성 설정 실패 (무시): {}".format(e))
+
+    # PostProcessVolume — Auto Exposure를 Manual로 고정해서 PIE에서 균일 노출
+    # (디폴트 Auto Exposure가 어두운 씬을 더 어둡게 적응시키는 문제 회피)
+    ppv = spawn_actor(unreal.PostProcessVolume, unreal.Vector(0, 0, 0), "GlobalPostProcess")
+    if ppv is not None:
+        try:
+            ppv.set_editor_property("unbound", True)  # 전체 월드 적용
+            settings = ppv.get_editor_property("settings")
+            # 여러 속성명 fallback (UE 버전별 차이)
+            for method_attr, bias_attr in (
+                ("auto_exposure_method", "auto_exposure_bias"),
+            ):
+                try:
+                    settings.set_editor_property(method_attr,
+                        unreal.AutoExposureMethod.AEM_MANUAL)
+                    settings.set_editor_property(bias_attr, 5.0)
+                    # override 플래그 (Manual 모드 적용을 위해 ON)
+                    for override_attr in (
+                        "override_auto_exposure_method",
+                        "override_auto_exposure_bias",
+                    ):
+                        try:
+                            settings.set_editor_property(override_attr, True)
+                        except Exception:
+                            pass
+                    break
+                except Exception as e:
+                    log("  PostProcess Exposure 설정 실패 (무시): {}".format(e))
+            ppv.set_editor_property("settings", settings)
+        except Exception as e:
+            log("  PostProcessVolume 설정 실패 (무시): {}".format(e))
+
+
+def build_navigation():
+    """NavMesh 빌드 트리거. 비동기로 진행되며 빌드 완료까지 시간 걸림."""
+    log("Triggering NavMesh build (RebuildNavigation)")
+    try:
+        world = get_editor_world()
+        if world is None:
+            log("  Editor World 없음 — 수동 빌드 필요: Build > Build Paths")
+            return
+
+        unreal.SystemLibrary.execute_console_command(world, "RebuildNavigation")
+        log("  RebuildNavigation 콘솔 명령 실행 — 빌드는 비동기. 완료 후 한 번 더 Save Level (Ctrl+S) 권장.")
+    except Exception as e:
+        log("  NavMesh 빌드 트리거 실패 (무시): {} — 수동 빌드: Build > Build Paths".format(e))
+
+
+def get_editor_world():
+    """현재 에디터 월드 — UE 5.x UnrealEditorSubsystem 우선, EditorLevelLibrary는 deprecated fallback."""
+    try:
+        editor_sub = get_subsystem(unreal.UnrealEditorSubsystem)
+        if editor_sub is not None and hasattr(editor_sub, "get_editor_world"):
+            return editor_sub.get_editor_world()
+    except Exception:
+        pass
+    try:
+        return unreal.EditorLevelLibrary.get_editor_world()
+    except Exception:
+        pass
+    return None
+
+
 def setup_world_game_mode_override():
     """World Settings의 GameMode Override를 AUE5TestProjectGameMode로 설정."""
     log("Setting World Settings GameMode Override")
-    level_subsystem = get_level_editor_subsystem()
-    if level_subsystem is None:
-        log("  LevelEditorSubsystem 없음 — World Settings 설정 스킵")
-        return
-
-    world = level_subsystem.get_editor_world() if hasattr(level_subsystem, "get_editor_world") \
-        else unreal.EditorLevelLibrary.get_editor_world()
+    world = get_editor_world()
     if world is None:
         log("  Editor World 없음 — 스킵")
         return
@@ -215,14 +355,28 @@ def setup_project_game_default_map():
     """Project Settings의 GameDefaultMap을 우리 맵으로. 게임 빌드 실행 시 자동 로드."""
     log("Setting Project Settings GameDefaultMap")
     try:
-        settings = unreal.GameMapsSettings.get_default_object()
+        # UE 5.x: get_default_object 대신 클래스 메서드 + SaveConfig (UClass 레벨)
+        settings = unreal.get_default_object(unreal.GameMapsSettings)
         map_soft_path = unreal.SoftObjectPath(MAP_PATH)
         settings.set_editor_property("game_default_map", map_soft_path)
-        # 영구 저장 (DefaultEngine.ini에 기록)
-        settings.save_config()
-        log("  GameDefaultMap = {}".format(MAP_PATH))
+
+        # save_config는 UE 5.x에서 메서드명/시그니처가 환경에 따라 다름 — 여러 경로 시도
+        saved = False
+        for method_name in ("save_config", "modify"):
+            if hasattr(settings, method_name):
+                try:
+                    getattr(settings, method_name)()
+                    saved = True
+                    break
+                except Exception:
+                    continue
+        if not saved:
+            log("  GameDefaultMap 메모리 설정은 성공, ini 저장은 수동 필요:")
+            log("    Project Settings > Maps & Modes > Game Default Map = NavDebugTest → 저장")
+        else:
+            log("  GameDefaultMap = {} (DefaultEngine.ini에 저장됨)".format(MAP_PATH))
     except Exception as e:
-        log("  GameDefaultMap 설정 실패 (UE 버전 API 차이 가능): {}".format(e))
+        log("  GameDefaultMap 설정 실패 (무시): {}".format(e))
         log("  수동 설정: Project Settings > Maps & Modes > Game Default Map = NavDebugTest")
 
 
@@ -247,11 +401,11 @@ def main():
     setup_floor()
     setup_walls()
     setup_nav_mesh_bounds()
-    path_start, path_end = setup_path_actors()
-    setup_nav_debug_actor(path_start, path_end)
     setup_player_start()
+    setup_lighting()
     setup_world_game_mode_override()
     setup_project_game_default_map()
+    build_navigation()
 
     saved = save_level()
     if saved:
