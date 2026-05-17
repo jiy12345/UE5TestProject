@@ -81,5 +81,8 @@ DerivedDataCache/
 .idea/
 *.sln.iml
 
-# Claude Code configuration
-.claude/
+# Claude Code configuration (local-only settings)
+.claude/settings.local.json
+
+# Per-subproject Claude session (local-only)
+Game/.claude/
