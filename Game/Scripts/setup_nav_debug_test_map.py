@@ -243,33 +243,26 @@ def _set_mobility(actor, mobility):
 
 
 def setup_lighting():
-    """환경광만 셋업 — NavDebug 검증엔 정교한 lighting 불필요.
-    SkyLight (Movable, 모든 방향 균일) + PostProcessVolume (Auto Exposure 끔, 노출 고정)."""
-    log("Spawning ambient lighting (SkyLight + PostProcessVolume)")
+    """최소 조명 — DirectionalLight 1개 + PostProcessVolume만.
+    SkyLight는 SkyAtmosphere/IsSky 메시 없으면 검은 환경광이 되므로 제외."""
+    log("Spawning minimal lighting (DirectionalLight only + PostProcessVolume)")
 
-    # SkyLight — 환경광. Lower Hemisphere도 어둡지 않게 → 모든 방향 균일
-    sky_light = spawn_actor(unreal.SkyLight, unreal.Vector(0, 0, 500), "SkyLight")
-    if sky_light is not None:
-        _set_mobility(sky_light, unreal.ComponentMobility.MOVABLE)
+    # DirectionalLight — 유일한 빛 source. Intensity 높여 환경광 부재 보완
+    sun = spawn_actor(unreal.DirectionalLight, unreal.Vector(0, 0, 1000), "DirectionalLight")
+    if sun is not None:
+        _set_mobility(sun, unreal.ComponentMobility.MOVABLE)
+        sun.set_actor_rotation(unreal.Rotator(-45.0, 0.0, 0.0), False)
         try:
-            sky_comp = sky_light.get_component_by_class(unreal.SkyLightComponent)
-            if sky_comp is not None:
-                # SLS_SpecifiedCubemap: cubemap 미지정이라도 디폴트 회색 환경광 제공.
-                # SkyAtmosphere 의존 없음 (DirectionalLight 미사용 환경에 적합).
+            light_comp = sun.get_component_by_class(unreal.DirectionalLightComponent)
+            if light_comp is not None:
                 try:
-                    sky_comp.set_editor_property("source_type",
-                        unreal.SkyLightSourceType.SLS_SPECIFIED_CUBEMAP)
+                    light_comp.set_mobility(unreal.ComponentMobility.MOVABLE)
                 except Exception:
                     pass
-                # 아래 반구도 회색으로 채워서 위/아래 균일 밝기
-                for attr in ("lower_hemisphere_is_black",):
-                    try:
-                        sky_comp.set_editor_property(attr, False)
-                    except Exception:
-                        pass
-                sky_comp.set_editor_property("intensity", 3.0)
+                # 환경광 없으니 직접광 강도 ↑ (그늘진 면은 여전히 어두움, NavDebug엔 충분)
+                light_comp.set_editor_property("intensity", 10.0)
         except Exception as e:
-            log("  SkyLight 속성 설정 실패 (무시): {}".format(e))
+            log("  DirectionalLight 속성 설정 실패 (무시): {}".format(e))
 
     # PostProcessVolume — Auto Exposure를 Manual로 고정해서 PIE에서 균일 노출
     # (디폴트 Auto Exposure가 어두운 씬을 더 어둡게 적응시키는 문제 회피)
